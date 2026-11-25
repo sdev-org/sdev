@@ -1,0 +1,134 @@
+/**
+ * The understanding agent: rules, memory, directives and dialect promotion.
+ * Run with: npm run test:agent
+ */
+import { understand, repair, scanDirectives, promoteToDialect, setMemoryStore, emptyMemory, parses, type AgentMemory } from '../src/lang/agent';
+import { parseError } from '../src/lang/agent/sense';
+import { execute } from '../src/lang';
+
+let memory: AgentMemory = emptyMemory();
+setMemoryStore({ load: () => memory, save: (m) => { memory = m; } });
+
+let passed = 0;
+let failed = 0;
+
+function check(name: string, actual: string, expected: string) {
+  const a = actual.trim().replace(/[ \t]+/g, ' ');
+  const e = expected.trim().replace(/[ \t]+/g, ' ');
+  if (a === e) { passed++; console.log(`  ok   ${name}`); }
+  else { failed++; console.log(`  FAIL ${name}\n       got:      ${a.replace(/\n/g, ' | ')}\n       expected: ${e.replace(/\n/g, ' | ')}`); }
+}
+
+function canon(src: string): string {
+  return repair(src).source;
+}
+
+console.log('understanding agent');
+
+// ---- the user's own example -----------------------------------------
+check(
+  'output / out / will be / terminal',
+  canon('output Hello\nout Nothing\nname1 will be Twenty\nterminal name1'),
+  'say "Hello"\nsay nothing\nset name1 to 20\nsay name1',
+);
+
+check('print with quotes', canon('print "hi there"'), 'say "hi there"');
+check('echo a variable', canon('set x to 3\necho x'), 'set x to 3\nsay x');
+check('equals assignment', canon('total = 4 + 5'), 'set total to 4 + 5');
+check('becomes assignment', canon('age becomes 21'), 'set age to 21');
+check('several statements on a line', canon('output A; output B'), 'say "A"\nsay "B"');
+check('loose condition', canon('if age is greater than 18'), 'if age > 18');
+check('at least', canon('if age at least 18'), 'if age is or more 18');
+check('function declaration', canon('def greet(name):'), 'to greet with name');
+check('foreach loop', canon('for each item in list:'), 'for each item in list');
+check('braces close', canon('}'), 'end');
+check('give back', canon('give back 7'), 'return 7');
+
+// ---- directives -------------------------------------------------------
+const off = scanDirectives('!#agent:off\nsay "x"');
+check('directive off', String(off.mode), 'off');
+check('directive stripped', off.source.trim(), 'say "x"');
+check('directive local', String(scanDirectives('!#agent:local').brain), 'local');
+check('directive online', String(scanDirectives('!#agent: online').brain), 'online');
+
+const disabled = understand('!#agent:off\nterminal hi');
+check('off leaves the file alone', disabled.source.trim(), 'terminal hi');
+
+// ---- canonical files are untouched -----------------------------------
+const clean = 'set x to 2\nsay x\n';
+check('canonical stays byte-identical', understand(clean).source, clean);
+
+// ---- memory ------------------------------------------------------------
+memory = emptyMemory();
+understand('shout "hi"');
+check('remembers the user word', memory.words['shout']?.intent ?? 'none', 'say');
+check('counts programs', String(memory.programs), '1');
+
+// ---- promotion to a dialect -------------------------------------------
+const spec = promoteToDialect({ name: 'My words', memory });
+check('promoted dialect slug', spec.meta.slug, 'my-words');
+check('promoted synonym', (spec.synonyms['say'] ?? []).join(','), 'shout');
+
+// ---- end to end through the interpreter -------------------------------
+const run = execute('output Hello\nname1 will be Twenty\nterminal name1');
+check('runs end to end', run.output.join('|'), 'Hello|20');
+
+// ---- sentence-style program from a real user session -------------------
+const sentences = understand([
+  'I want function called 11 with variable named tuesday',
+  'i need wednesday to be tuesday + 1',
+  'say to terminal wednesday',
+  '',
+  'call 11 with 2',
+].join('\n')).source;
+check('sentence function', sentences.split('\n')[0], 'to n11 with tuesday');
+check('sentence assignment', sentences.split('\n')[1].trim(), 'set wednesday to tuesday + 1');
+check('sentence say', sentences.split('\n')[2].trim(), 'say wednesday');
+check('sentence closes block', String(sentences.includes('end')), 'true');
+check('sentence call', String(sentences.includes('n11(2)')), 'true');
+check('sentence runs', execute(sentences).output.join('|'), '3');
+
+// ---- working sdev is never rewritten -------------------------------------
+memory = emptyMemory();
+for (const src of [
+  'forge double be x -> x * 2\nspeak(double(5))',
+  'forge data be :: "score": 100, "name": "Alice" ;;\nspeak(data["score"])',
+  'conjure total(nums) ::\n  yield fold(nums, 0, (acc, x) -> acc + x)\n;;\nspeak(total([1, 2, 3]))',
+  'forge n be 3\nponder n > 2 ::\n  speak("big")\n;;',
+]) check(`working file untouched: ${src.split('\n')[0]}`, understand(src).source, src);
+
+// ---- rules keep code that is already code ---------------------------------
+check('call keeps its bracket', repair('set p to int(s)\nsay p').source, 'set p to int(s)\nsay p');
+check('parameter named a', repair('to add with a b\n  return a + b\nend').source, 'to add with a b\n  return a + b\nend');
+check('method call kept', repair('set c to new Counter()\nc.start(5)').source, 'set c to new Counter()\nc.start(5)');
+
+// ---- hardware board blocks are firmware, never rewritten -------------------
+memory = emptyMemory();
+const boardColon = 'board "uno" ::\n  conjure setup() ::\n    pin led be output\n    speak("ready")\n  ;;\n  conjure loop() ::\n    pin led toggle\n    wait 500\n  ;;\n;;\n';
+const boardBrace = 'board "uno" {\n  conjure setup() {\n    pin 13 be output\n    serial begin 9600\n  }\n  conjure loop() {\n    pin 13 write high\n    wait 500\n  }\n}\n';
+check('board :: block kept byte for byte', understand(boardColon).source, boardColon);
+check('board { } block kept byte for byte', understand(boardBrace).source, boardBrace);
+{
+  const r = understand('output Hello\n' + boardBrace);
+  check('sdev around a board block is still understood', r.source, 'speak("Hello")\n' + boardBrace);
+}
+// ---- hardware: loose board code is read into the hardware language ---------
+memory = emptyMemory();
+check('hardware: plain words become pin and wait statements',
+  understand('board "uno" ::\n  conjure setup() ::\n    set pin 13 as output\n  ;;\n  conjure loop() ::\n    turn on the led\n    wait one second\n    turn off pin 13\n    wait half a second\n  ;;\n;;\n').source,
+  'board "uno" ::\n  conjure setup() ::\n    pin 13 be output\n  ;;\n  conjure loop() ::\n    pin led on\n    wait 1 second\n    pin 13 off\n    wait 500\n  ;;\n;;\n');
+check('hardware: Python-style blocks get setup(), loop() and their ;;',
+  understand('board uno:\n  setup:\n    make the led an output\n  loop:\n    blink the led every 200 ms\n    if pin 2 is high:\n      beep on pin 8 at 440 for 200 ms\n    else:\n      toggle pin 12\n').source,
+  'board "uno" ::\n  conjure setup() ::\n    pin led be output\n  ;;\n  conjure loop() ::\n    pin led on\n    wait 200\n    pin led off\n    wait 200\n    ponder read pin 2 equals HIGH ::\n      tone 8 440 200\n    otherwise ::\n      pin 12 toggle\n    ;;\n  ;;\n;;\n');
+check('hardware: the documented script-style example gets setup() and loop()',
+  understand('board "uno"\n  pin 13 is output\n  forever\n    turn 13 on ; wait 500ms\n    turn 13 off; wait 500ms\n  end\nend\n').source,
+  'board "uno" ::\n  conjure setup() ::\n    pin 13 be output\n  ;;\n  conjure loop() ::\n    pin 13 on\n    wait 500\n    pin 13 off\n    wait 500\n  ;;\n;;\n');
+{
+  const r = understand('board "uno" ::\n  conjure setup() ::\n  ;;\n  conjure loop() ::\n    do the macarena with the servo\n  ;;\n;;\n');
+  check('hardware: a line no rule can read is reported, not guessed', JSON.stringify(r.unresolved), '[5]');
+}
+check('parses returns true for valid code', String(parses('set x to 5') && parses('to foo() \n 1 \n end')), 'true');
+check('parses returns false for invalid code', String(!parses('set x to') && !parses('function () {')), 'true');
+check('parseError returns null for valid code and string for invalid', String(parseError('set x to 5') === null && typeof parseError('set x to') === 'string'), 'true');
+console.log(`\n${passed} passed, ${failed} failed`);
+process.exit(failed ? 1 : 0);

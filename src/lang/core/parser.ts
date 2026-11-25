@@ -1,0 +1,2293 @@
+import { Token, TokenType } from './tokens';
+import { Lexer } from './lexer';
+import * as AST from './ast';
+import { SdevError } from './errors';
+import { WORDS_BY_TOKEN } from './keywords';
+
+/** Every spelling of the contextual constant-declaration keyword (`fixed`, `const`, `val`). */
+const FIXED_WORDS = new Set<string>(WORDS_BY_TOKEN.FIXED ?? ['fixed', 'const', 'val']);
+
+/**
+ * sdev recursive-descent parser.
+ *
+ * Supports the full v1 dialect plus the Python-parity surface:
+ * decorators, generators, comprehensions, pattern matching, context
+ * managers, star-params, keyword arguments, slices, sets, tuples,
+ * f-strings, walrus binding, augmented assignment, typed annotations,
+ * structured exception handling and module imports.
+ */
+export class Parser {
+  private tokens: Token[];
+  private pos: number = 0;
+
+  constructor(tokens: Token[]) {
+    this.tokens = tokens;
+  }
+
+  parse(): AST.Program {
+    const statements: AST.ASTNode[] = [];
+    while (!this.isAtEnd()) {
+      statements.push(this.parseStatement());
+    }
+    return { type: 'Program', statements, line: 1 };
+  }
+
+  // ==========================================================
+  // Statements
+  // ==========================================================
+
+  private parseStatement(): AST.ASTNode {
+    if (this.check(TokenType.AT) && this.isDecoratorPosition()) return this.parseDecorated();
+    if (this.check(TokenType.FORGE)) return this.parseForgeStatement(false);
+    if (this.isContextualFixedStart()) return this.parseForgeStatement(true);
+    if (this.check(TokenType.CONJURE)) return this.parseConjureDeclaration();
+    if (this.check(TokenType.ASYNC)) return this.parseAsyncStatement();
+    if (this.check(TokenType.PONDER)) return this.parsePonderStatement();
+    if (this.check(TokenType.CYCLE)) return this.parseCycleStatement();
+    if (this.check(TokenType.ITERATE)) return this.parseIterateStatement();
+    if (this.check(TokenType.WITHIN)) return this.parseWithinStatement();
+    if (this.check(TokenType.YIELD)) return this.parseYieldStatement();
+    if (this.check(TokenType.YEET)) return this.parseYeetStatement();
+    if (this.check(TokenType.SKIP)) return this.parseSkipStatement();
+    if (this.check(TokenType.PASS)) { const t = this.advance(); return { type: 'PassStatement', line: t.line }; }
+    if (this.check(TokenType.ATTEMPT)) return this.parseAttemptStatement();
+    if (this.check(TokenType.WITH)) return this.parseWithStatement(false);
+    if (this.check(TokenType.MATCH) && this.isMatchStatement()) return this.parseMatchStatement();
+    if (this.check(TokenType.RAISE)) return this.parseRaiseStatement();
+    if (this.check(TokenType.ASSERT)) return this.parseAssertStatement();
+    if (this.check(TokenType.DEL) && this.tokens[this.pos + 1]?.type !== TokenType.LPAREN) return this.parseDelStatement();
+    if (this.check(TokenType.GLOBAL) || this.check(TokenType.NONLOCAL)) return this.parseScopeStatement();
+    if (this.check(TokenType.SUMMON)) return this.parseImportStatement();
+    if (this.check(TokenType.FROM)) return this.parseFromImportStatement();
+    if (this.check(TokenType.ESSENCE_KW)) return this.parseEssenceDeclaration();
+    // 'essence' stays a contextual keyword - check by value
+    if (this.isContextualClassStart()) return this.parseEssenceDeclaration();
+    if (this.isContextualFeatureStart()) return this.parseFeatureDeclaration();
+    if (this.isContextualRefineStart()) return this.parseRefineDeclaration();
+    // Reassignment dialects used by the sdev stdlib:
+    //   be x be value        (leading-'be' form)
+    //   set x to value       (ML/v2 form, 'set'/'to' are contextual)
+    if (this.check(TokenType.BE)) return this.parseLeadingBeStatement();
+    if (this.checkIdentifierValue('set') && this.isSetToStatement()) return this.parseSetToStatement();
+    // `either cond :: ... ;; otherwise :: ... ;;` — guard form used by the stdlib.
+    if (this.check(TokenType.EITHER)) return this.parseEitherStatement();
+
+    // v2 / natural function form: `to greet with name` ... `end`
+    if (this.isToDeclaration()) return this.parseToDeclaration();
+
+    if (this.check(TokenType.DOUBLE_COLON)) return this.parseBlockStatement();
+    return this.parseExpressionStatement();
+  }
+
+  /** `to name ...` on its own line declares a function (v2 / natural form). */
+  private isToDeclaration(): boolean {
+    if (!this.checkIdentifierValue('to')) return false;
+    const next = this.tokens[this.pos + 1];
+    if (!next || next.type !== TokenType.IDENTIFIER || next.line !== this.peek().line) return false;
+    // `to name` must be followed by a parameter list or nothing else on the line,
+    // so ordinary phrases like `to terminal wednesday` stay expressions.
+    const after = this.tokens[this.pos + 2];
+    if (!after || after.line !== next.line) return true;
+    return after.type === TokenType.LPAREN || after.type === TokenType.WITH || (after.type === TokenType.IDENTIFIER && after.value === 'with');
+  }
+
+  /** to name [with a b c] [when guard] (<block> end | => expr) */
+  private parseToDeclaration(): AST.FuncDeclaration {
+    const toToken = this.advance();
+    const name = this.consumeName('Expected function name');
+    let paramSpecs: AST.Param[] = [];
+    let patternParams: (AST.PatternNode | null)[] = [];
+    if (this.check(TokenType.WITH) || this.checkIdentifierValue('with')) {
+      this.advance();
+      while (
+        this.check(TokenType.IDENTIFIER) &&
+        this.peek().line === toToken.line &&
+        !this.check(TokenType.WHEN) &&
+        !this.check(TokenType.FATARROW)
+      ) {
+        const pname = this.advance().value;
+        paramSpecs.push({ name: pname, kind: 'normal' });
+        patternParams.push(null);
+        this.match(TokenType.COMMA);
+      }
+    } else if (this.check(TokenType.LPAREN) && this.peek().line === toToken.line) {
+      const parsed = this.parseFuncParamList();
+      paramSpecs = parsed.paramSpecs;
+      patternParams = parsed.patternParams;
+    }
+    let guard: AST.ASTNode | undefined;
+    if (this.match(TokenType.WHEN)) {
+      guard = this.parseExpression();
+    }
+    let body: AST.BlockStatement;
+    if (this.match(TokenType.FATARROW)) {
+      const expr = this.parseExpression();
+      body = {
+        type: 'BlockStatement',
+        statements: [{ type: 'ReturnStatement', value: expr, line: expr.line }],
+        line: expr.line,
+      };
+    } else {
+      body = this.parseBlockStatement();
+    }
+    const hasPatterns = patternParams.some((p) => p !== null);
+    return {
+      type: 'FuncDeclaration',
+      name,
+      params: paramSpecs.map((p) => p.name),
+      paramSpecs,
+      ...(hasPatterns ? { patternParams } : {}),
+      ...(guard ? { guard } : {}),
+      isGenerator: this.blockEmits(body),
+      body,
+      line: toToken.line,
+    } as AST.FuncDeclaration;
+  }
+
+  /** `end` is a contextual block closer for the natural block form. */
+  private checkEndWord(): boolean {
+    return this.checkIdentifierValue('end');
+  }
+
+  /** A '@' begins a decorator only when a declaration follows on a later token. */
+  private isDecoratorPosition(): boolean {
+    const next = this.tokens[this.pos + 1];
+    return !!next && (next.type === TokenType.IDENTIFIER || next.type === TokenType.ESSENCE_KW);
+  }
+
+  /** `match` is a statement when a block follows the subject; otherwise it's an identifier. */
+  private isMatchStatement(): boolean {
+    for (let i = this.pos + 1; i < this.tokens.length; i++) {
+      const t = this.tokens[i];
+      if (t.type === TokenType.DOUBLE_COLON) return true;
+      if (t.type === TokenType.DOUBLE_SEMI || t.type === TokenType.EOF) return false;
+      if (t.line !== this.peek().line) return false;
+    }
+    return false;
+  }
+
+  // @decorator ... conjure/essence
+  private parseDecorated(): AST.ASTNode {
+    const decorators: AST.ASTNode[] = [];
+    while (this.check(TokenType.AT) && this.isDecoratorPosition()) {
+      this.advance();
+      decorators.push(this.parseCall());
+    }
+    if (this.check(TokenType.ASYNC)) {
+      const node = this.parseAsyncStatement();
+      if (node.type === 'FuncDeclaration') node.decorators = decorators;
+      return node;
+    }
+    if (this.check(TokenType.CONJURE)) {
+      const fn = this.parseConjureDeclaration();
+      fn.decorators = decorators;
+      return fn;
+    }
+    if (this.check(TokenType.ESSENCE_KW) || this.isContextualClassStart()) {
+      const cls = this.parseEssenceDeclaration();
+      cls.decorators = decorators;
+      return cls;
+    }
+    throw new SdevError('Decorators must precede a function or class declaration', this.peek().line);
+  }
+
+  private parseAsyncStatement(): AST.ASTNode {
+    const asyncToken = this.consume(TokenType.ASYNC, "Expected 'async'");
+    if (this.check(TokenType.CONJURE)) {
+      const fn = this.parseConjureDeclaration();
+      fn.isAsync = true;
+      fn.line = asyncToken.line;
+      return fn;
+    }
+    if (this.check(TokenType.WITH)) return this.parseWithStatement(true);
+    if (this.check(TokenType.ITERATE)) {
+      const loop = this.parseIterateStatement();
+      loop.isAsync = true;
+      return loop;
+    }
+    throw new SdevError("'async' must precede a function, loop or with-block", asyncToken.line);
+  }
+
+  // be target be value  — same targets as `target be value`
+  private parseLeadingBeStatement(): AST.ASTNode {
+    this.consume(TokenType.BE, "Expected 'be'");
+    return this.parseExpressionStatement();
+  }
+
+  // either condition :: body ;; [otherwise :: body ;; | otherwise either ...]
+  private parseEitherStatement(): AST.IfStatement {
+    const eitherToken = this.consume(TokenType.EITHER, "Expected 'either'");
+    const condition = this.parseExpression();
+    const thenBranch = this.parseBlockStatement();
+
+    let elseBranch: AST.BlockStatement | AST.IfStatement | undefined;
+    if (this.match(TokenType.OTHERWISE)) {
+      if (this.check(TokenType.EITHER)) elseBranch = this.parseEitherStatement();
+      else elseBranch = this.parseBlockStatement();
+    }
+
+    return { type: 'IfStatement', condition, thenBranch, elseBranch, line: eitherToken.line };
+  }
+
+  /** Lookahead: does this `set ...` line contain a `to` before the statement ends? */
+  private isSetToStatement(): boolean {
+    let depth = 0;
+    for (let i = this.pos + 1; i < this.tokens.length; i++) {
+      const t = this.tokens[i];
+      if (t.type === TokenType.LPAREN || t.type === TokenType.LBRACKET || t.type === TokenType.LBRACE) depth++;
+      else if (t.type === TokenType.RPAREN || t.type === TokenType.RBRACKET || t.type === TokenType.RBRACE) depth--;
+      else if (depth === 0 && t.type === TokenType.IDENTIFIER && t.value === 'to') return true;
+      else if (depth === 0 && (t.type === TokenType.DOUBLE_COLON || t.type === TokenType.DOUBLE_SEMI || t.type === TokenType.EOF)) return false;
+    }
+    return false;
+  }
+
+  // set target to value
+  private parseSetToStatement(): AST.ASTNode {
+    const setToken = this.advance(); // 'set'
+    const target = this.parseExpression();
+    const toToken = this.peek();
+    if (!(toToken.type === TokenType.IDENTIFIER && toToken.value === 'to')) {
+      throw new SdevError("Expected 'to' in set statement", setToken.line);
+    }
+    this.advance();
+    const value = this.parseExpression();
+    const node = this.makeAssignment(target, value, setToken.line);
+    // `set` both declares and assigns, matching the v2 compiler.
+    if (node.type === 'AssignStatement') node.declare = true;
+    return node;
+  }
+
+  private makeAssignment(target: AST.ASTNode, value: AST.ASTNode, line: number): AST.ASTNode {
+    if (target.type === 'Identifier') {
+      return { type: 'AssignStatement', name: target.name, value, line };
+    }
+    if (target.type === 'IndexExpr') {
+      return { type: 'IndexAssignStatement', object: target.object, index: target.index, value, line };
+    }
+    if (target.type === 'MemberExpr') {
+      return { type: 'MemberAssignStatement', object: target.object, property: target.property, value, line };
+    }
+    if (target.type === 'TupleLiteral' || target.type === 'ArrayLiteral') {
+      let starIndex: number | undefined;
+      const names = (target.elements as AST.ASTNode[]).map((e, i) => {
+        if (e.type === 'StarExpr') {
+          starIndex = i;
+          const target = (e as AST.StarExpr).operand;
+          if (!target || target.type !== 'Identifier') throw new SdevError('Invalid destructuring target', line);
+          return target.name;
+        }
+        if (e.type !== 'Identifier') throw new SdevError('Invalid destructuring target', line);
+        return e.name;
+      });
+      return { type: 'LetStatement', name: names[0], targets: names, starIndex, value, line };
+    }
+    throw new SdevError('Invalid assignment target', line);
+  }
+
+  // forge name[: Type] be value    |    forge a, b be pair
+  // fixed name[: Type] be value
+  private parseForgeStatement(isFixed = false): AST.LetStatement {
+    const token = isFixed
+      ? this.advance()
+      : this.consume(TokenType.FORGE, "Expected 'forge'");
+    // A target list may contain one starred name: `forge a, *rest be xs`.
+    let starIndex: number | undefined;
+    const readTarget = (): string => {
+      if (this.check(TokenType.STAR)) {
+        this.advance();
+        starIndex = names.length;
+      }
+      return this.consumeName('Expected variable name');
+    };
+    const names: string[] = [];
+    names.push(readTarget());
+    while (this.match(TokenType.COMMA)) names.push(readTarget());
+
+    let annotation: AST.ASTNode | undefined;
+    if (this.match(TokenType.COLON)) annotation = this.parseTypeExpr();
+
+    // Declaration without initialiser: `forge x: Int`
+    if (!this.check(TokenType.BE)) {
+      return { type: 'LetStatement', name: names[0], targets: names.length > 1 ? names : undefined, starIndex, annotation, value: { type: 'NullLiteral', line: token.line }, line: token.line, isFixed };
+    }
+    this.consume(TokenType.BE, "Expected 'be'");
+    const value = this.parseExpressionOrTuple();
+    return {
+      type: 'LetStatement',
+      name: names[0],
+      targets: names.length > 1 ? names : undefined,
+      starIndex,
+      annotation,
+      value,
+      line: token.line,
+      isFixed,
+    };
+  }
+
+  /** Type annotations are ordinary expressions (`Int`, `List[Str]`, `Int | Void`). */
+  private parseTypeExpr(): AST.ASTNode {
+    return this.parseBitOr();
+  }
+
+  // conjure name(params) [-> Type] [when guard] (:: body ;; | => expr)
+  private parseConjureDeclaration(): AST.FuncDeclaration {
+    const conjureToken = this.consume(TokenType.CONJURE, "Expected 'conjure'");
+    const name = this.consumeName('Expected function name');
+    const { paramSpecs, patternParams } = this.parseFuncParamList();
+    let returnType: AST.ASTNode | undefined;
+    if (this.match(TokenType.ARROW)) returnType = this.parseTypeExpr();
+    let guard: AST.ASTNode | undefined;
+    if (this.match(TokenType.WHEN)) guard = this.parseExpression();
+
+    let body: AST.BlockStatement;
+    if (this.match(TokenType.FATARROW)) {
+      const expr = this.parseExpression();
+      body = {
+        type: 'BlockStatement',
+        statements: [{ type: 'ReturnStatement', value: expr, line: expr.line }],
+        line: expr.line,
+      };
+    } else {
+      body = this.parseBlockStatement();
+    }
+    const hasPatterns = patternParams.some((p) => p !== null);
+    return {
+      type: 'FuncDeclaration',
+      name,
+      params: paramSpecs.map((p) => p.name),
+      paramSpecs,
+      ...(hasPatterns ? { patternParams } : {}),
+      ...(guard ? { guard } : {}),
+      returnType,
+      isGenerator: this.blockEmits(body),
+      body,
+      line: conjureToken.line,
+    };
+  }
+
+  /** Does this function body contain an `emit` / `delegate` (making it a generator)? */
+  private blockEmits(node: AST.ASTNode): boolean {
+    let found = false;
+    const walk = (n: unknown): void => {
+      if (found || !n || typeof n !== 'object') return;
+      const node = n as { type?: string;[k: string]: unknown };
+      if (node.type === 'EmitExpr') { found = true; return; }
+      // Do not descend into nested function bodies.
+      if (node.type === 'FuncDeclaration' || node.type === 'LambdaExpr') return;
+      for (const key of Object.keys(node)) {
+        const v = node[key];
+        if (Array.isArray(v)) v.forEach(walk);
+        else if (v && typeof v === 'object') walk(v);
+      }
+    };
+    walk(node);
+    return found;
+  }
+
+  private parseParamList(): AST.Param[] {
+    return this.parseFuncParamList().paramSpecs;
+  }
+
+  private isPatternParamStart(): boolean {
+    const t = this.peek();
+    if (
+      t.type === TokenType.NUMBER ||
+      t.type === TokenType.STRING ||
+      t.type === TokenType.YEP ||
+      t.type === TokenType.NOPE ||
+      t.type === TokenType.VOID ||
+      t.type === TokenType.MINUS ||
+      t.type === TokenType.LBRACKET ||
+      t.type === TokenType.LBRACE
+    ) {
+      return true;
+    }
+    if (t.type === TokenType.IDENTIFIER && t.value === '_') return true;
+    if (t.type === TokenType.IDENTIFIER) {
+      const next = this.tokens[this.pos + 1];
+      if (
+        next &&
+        (next.type === TokenType.LPAREN ||
+          next.type === TokenType.DOT ||
+          next.type === TokenType.BAR ||
+          next.type === TokenType.AS)
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private parseFuncParamList(): { paramSpecs: AST.Param[]; patternParams: (AST.PatternNode | null)[] } {
+    this.consume(TokenType.LPAREN, "Expected '('");
+    const params: AST.Param[] = [];
+    const patternParams: (AST.PatternNode | null)[] = [];
+    let kwOnly = false;
+    if (!this.check(TokenType.RPAREN)) {
+      do {
+        if (this.check(TokenType.RPAREN)) break;
+        // `/` marks the end of positional-only params
+        if (this.check(TokenType.SLASH)) {
+          this.advance();
+          for (const p of params) if (p.kind === 'normal') p.kind = 'posonly';
+          continue;
+        }
+        // bare `*` marks the start of keyword-only params
+        if (this.check(TokenType.STAR) && (this.tokens[this.pos + 1]?.type === TokenType.COMMA || this.tokens[this.pos + 1]?.type === TokenType.RPAREN)) {
+          this.advance();
+          kwOnly = true;
+          continue;
+        }
+        if (this.isPatternParamStart()) {
+          const pat = this.parsePattern();
+          const synName = `__pat_${params.length}`;
+          params.push({ name: synName, kind: kwOnly ? 'kwonly' : 'normal' });
+          patternParams.push(pat);
+          continue;
+        }
+        let kind: AST.Param['kind'] = kwOnly ? 'kwonly' : 'normal';
+        if (this.match(TokenType.STARSTAR)) kind = 'named';
+        else if (this.match(TokenType.STAR)) { kind = 'rest'; kwOnly = true; }
+
+        let name: string;
+        if (this.check(TokenType.SELF)) { this.advance(); name = 'self'; }
+        else name = this.consumeName('Expected parameter name');
+
+        let annotation: AST.ASTNode | undefined;
+        if (this.match(TokenType.COLON)) annotation = this.parseTypeExpr();
+        let def: AST.ASTNode | undefined;
+        if (this.match(TokenType.BE)) def = this.parseExpression();
+
+        params.push({ name, kind, annotation, default: def });
+        patternParams.push(null);
+      } while (this.match(TokenType.COMMA));
+    }
+    this.consume(TokenType.RPAREN, "Expected ')'");
+    return { paramSpecs: params, patternParams };
+  }
+
+  // essence/kind Name (extend A, B)? :: fields + methods ;;
+  private parseEssenceDeclaration(): AST.ClassDeclaration {
+    const essenceToken = this.advance(); // 'essence' | 'kind' | 'class'
+    const name = this.consumeName('Expected class name');
+
+    const superClasses: string[] = [];
+    let metaclass: string | undefined;
+    if (this.match(TokenType.EXTEND)) {
+      do {
+        superClasses.push(this.consumeName('Expected superclass name'));
+      } while (this.match(TokenType.COMMA));
+    } else if (this.check(TokenType.LPAREN)) {
+      // Python-style base list: kind Name(Base1, Base2, metaclass be M)
+      this.advance();
+      if (!this.check(TokenType.RPAREN)) {
+        do {
+          if (this.check(TokenType.RPAREN)) break;
+          const id = this.consumeName('Expected base class name');
+          if (this.match(TokenType.BE)) {
+            const target = this.consumeName('Expected metaclass name');
+            if (id === 'metaclass') metaclass = target;
+          } else {
+            superClasses.push(id);
+          }
+        } while (this.match(TokenType.COMMA));
+      }
+      this.consume(TokenType.RPAREN, "Expected ')'");
+    }
+
+    this.consume(TokenType.DOUBLE_COLON, "Expected '::'");
+    const methods: AST.FuncDeclaration[] = [];
+    const fields: AST.LetStatement[] = [];
+    while (!this.check(TokenType.DOUBLE_SEMI) && !this.isAtEnd()) {
+      if (this.check(TokenType.AT) && this.isDecoratorPosition()) {
+        const decorated = this.parseDecorated();
+        if (decorated.type === 'FuncDeclaration') methods.push(decorated);
+        continue;
+      }
+      if (this.check(TokenType.ASYNC)) {
+        const node = this.parseAsyncStatement();
+        if (node.type === 'FuncDeclaration') methods.push(node);
+        continue;
+      }
+      if (this.check(TokenType.CONJURE)) {
+        methods.push(this.parseConjureDeclaration());
+        continue;
+      }
+      if (this.check(TokenType.FORGE)) {
+        fields.push(this.parseForgeStatement());
+        continue;
+      }
+      if (this.check(TokenType.PASS)) { this.advance(); continue; }
+      // Skip unknown tokens inside class body (docstrings etc.)
+      this.advance();
+    }
+    this.consume(TokenType.DOUBLE_SEMI, "Expected ';;'");
+    return {
+      type: 'ClassDeclaration',
+      name,
+      superClass: superClasses[0],
+      superClasses,
+      fields,
+      metaclass,
+      methods,
+      line: essenceToken.line,
+    };
+  }
+
+  private isContextualFeatureStart(): boolean {
+    if (!this.checkIdentifierValue('feature') && !this.checkIdentifierValue('facet')) return false;
+    const tok = this.peek();
+    const next = this.tokens[this.pos + 1];
+    if (!next || next.type !== TokenType.IDENTIFIER || next.line !== tok.line) return false;
+    const after = this.tokens[this.pos + 2];
+    if (!after || after.line !== next.line) return true;
+    return (
+      after.type === TokenType.DOUBLE_COLON ||
+      after.type === TokenType.EXTEND ||
+      (after.type === TokenType.IDENTIFIER && (after.value === 'requires' || after.value === 'excludes'))
+    );
+  }
+
+  private parseFeatureDeclaration(): AST.FeatureDeclaration {
+    const featureToken = this.advance(); // 'feature' | 'facet'
+    const name = this.consumeName('Expected feature name');
+    const requires: string[] = [];
+    const excludes: string[] = [];
+
+    const parseNameList = (): string[] => {
+      const names: string[] = [];
+      if (this.match(TokenType.LBRACKET)) {
+        if (!this.check(TokenType.RBRACKET)) {
+          do {
+            if (this.check(TokenType.RBRACKET)) break;
+            names.push(this.consumeName('Expected feature name'));
+          } while (this.match(TokenType.COMMA));
+        }
+        this.consume(TokenType.RBRACKET, "Expected ']'");
+        return names;
+      }
+      names.push(this.consumeName('Expected feature name'));
+      while (this.match(TokenType.COMMA)) {
+        names.push(this.consumeName('Expected feature name'));
+      }
+      return names;
+    };
+
+    for (;;) {
+      if (this.checkIdentifierValue('requires')) {
+        this.advance();
+        requires.push(...parseNameList());
+      } else if (this.checkIdentifierValue('excludes')) {
+        this.advance();
+        excludes.push(...parseNameList());
+      } else if (this.match(TokenType.EXTEND)) {
+        requires.push(...parseNameList());
+      } else {
+        break;
+      }
+    }
+
+    const refinements: AST.RefineDeclaration[] = [];
+    const methods: AST.FuncDeclaration[] = [];
+    const fields: AST.LetStatement[] = [];
+    const statements: AST.ASTNode[] = [];
+
+    const pushMember = (stmt: AST.ASTNode) => {
+      if (stmt.type === 'RefineDeclaration') refinements.push(stmt);
+      else if (stmt.type === 'FuncDeclaration') methods.push(stmt);
+      else if (stmt.type === 'LetStatement') fields.push(stmt);
+      else if (stmt.type === 'AssignStatement' && stmt.declare) {
+        fields.push({ type: 'LetStatement', name: stmt.name, value: stmt.value, line: stmt.line });
+      } else {
+        statements.push(stmt);
+      }
+    };
+
+    if (this.check(TokenType.DOUBLE_COLON)) {
+      this.advance();
+      while (!this.check(TokenType.DOUBLE_SEMI) && !this.isAtEnd()) {
+        pushMember(this.parseStatement());
+      }
+      this.consume(TokenType.DOUBLE_SEMI, "Expected ';;'");
+    } else {
+      while (!this.isAtEnd() && !this.checkEndWord() && !this.check(TokenType.DOUBLE_SEMI)) {
+        pushMember(this.parseStatement());
+      }
+      if (this.checkEndWord()) this.advance();
+    }
+
+    return {
+      type: 'FeatureDeclaration',
+      name,
+      requires,
+      excludes,
+      refinements,
+      methods,
+      fields,
+      statements,
+      line: featureToken.line,
+    };
+  }
+
+  private isContextualRefineStart(): boolean {
+    if (!this.checkIdentifierValue('refine') && !this.checkIdentifierValue('augment')) return false;
+    const tok = this.peek();
+    const next = this.tokens[this.pos + 1];
+    if (!next || next.line !== tok.line) return false;
+    if (
+      next.type === TokenType.CONJURE ||
+      next.type === TokenType.ESSENCE_KW ||
+      next.type === TokenType.ESSENCE ||
+      (next.type === TokenType.IDENTIFIER && ['essence', 'kind', 'class', 'to', 'func', 'def'].includes(next.value))
+    ) {
+      const target = this.tokens[this.pos + 2];
+      return !!target && target.type === TokenType.IDENTIFIER && target.line === tok.line;
+    }
+    if (next.type !== TokenType.IDENTIFIER) return false;
+    const after = this.tokens[this.pos + 2];
+    if (!after || after.line !== next.line) return true;
+    if (after.type === TokenType.DOUBLE_COLON) return true;
+    if (after.type === TokenType.WITH || (after.type === TokenType.IDENTIFIER && after.value === 'with')) return true;
+    if (after.type === TokenType.LPAREN) {
+      let depth = 1;
+      let i = this.pos + 3;
+      while (i < this.tokens.length && depth > 0) {
+        if (this.tokens[i].type === TokenType.LPAREN) depth++;
+        else if (this.tokens[i].type === TokenType.RPAREN) depth--;
+        i++;
+      }
+      const postParen = this.tokens[i];
+      if (!postParen || postParen.line !== tok.line) return true;
+      return (
+        postParen.type === TokenType.DOUBLE_COLON ||
+        postParen.type === TokenType.ARROW ||
+        postParen.type === TokenType.FATARROW
+      );
+    }
+    return false;
+  }
+
+  private parseRefineDeclaration(): AST.RefineDeclaration {
+    const refineToken = this.advance(); // 'refine' | 'augment'
+    let isFuncModifier = false;
+    let isClassModifier = false;
+
+    if (
+      this.match(TokenType.CONJURE) ||
+      this.checkIdentifierValue('to') ||
+      this.checkIdentifierValue('func') ||
+      this.checkIdentifierValue('def')
+    ) {
+      if (this.previous().type !== TokenType.CONJURE) this.advance();
+      isFuncModifier = true;
+    } else if (
+      this.match(TokenType.ESSENCE_KW, TokenType.ESSENCE) ||
+      this.checkIdentifierValue('essence') ||
+      this.checkIdentifierValue('kind') ||
+      this.checkIdentifierValue('class')
+    ) {
+      if (this.previous().type !== TokenType.ESSENCE_KW && this.previous().type !== TokenType.ESSENCE) {
+        this.advance();
+      }
+      isClassModifier = true;
+    }
+
+    const targetName = this.consumeName('Expected class or function name to refine');
+
+    const isFunctionRefine =
+      isFuncModifier ||
+      (!isClassModifier &&
+        (this.check(TokenType.LPAREN) ||
+          this.check(TokenType.WITH) ||
+          this.checkIdentifierValue('with')));
+
+    if (isFunctionRefine) {
+      let paramSpecs: AST.Param[] = [];
+      if (this.check(TokenType.LPAREN)) {
+        paramSpecs = this.parseParamList();
+      } else if (this.check(TokenType.WITH) || this.checkIdentifierValue('with')) {
+        this.advance();
+        while (
+          this.check(TokenType.IDENTIFIER) &&
+          this.peek().line === refineToken.line &&
+          !this.check(TokenType.FATARROW)
+        ) {
+          paramSpecs.push({ name: this.advance().value, kind: 'normal' });
+          this.match(TokenType.COMMA);
+        }
+      }
+      if (this.match(TokenType.ARROW)) this.parseTypeExpr();
+      let body: AST.BlockStatement;
+      if (this.match(TokenType.FATARROW)) {
+        const expr = this.parseExpression();
+        body = {
+          type: 'BlockStatement',
+          statements: [{ type: 'ReturnStatement', value: expr, line: expr.line }],
+          line: expr.line,
+        };
+      } else {
+        body = this.parseBlockStatement();
+      }
+      return {
+        type: 'RefineDeclaration',
+        targetName,
+        isFunctionRefine: true,
+        params: paramSpecs.map((p) => p.name),
+        paramSpecs,
+        methods: [],
+        fields: [],
+        body,
+        line: refineToken.line,
+      };
+    }
+
+    const methods: AST.FuncDeclaration[] = [];
+    const fields: AST.LetStatement[] = [];
+    const readClassRefineItem = () => {
+      if (this.check(TokenType.AT) && this.isDecoratorPosition()) {
+        const decorated = this.parseDecorated();
+        if (decorated.type === 'FuncDeclaration') methods.push(decorated);
+        return;
+      }
+      if (this.check(TokenType.ASYNC)) {
+        const node = this.parseAsyncStatement();
+        if (node.type === 'FuncDeclaration') methods.push(node);
+        return;
+      }
+      if (this.check(TokenType.CONJURE)) {
+        methods.push(this.parseConjureDeclaration());
+        return;
+      }
+      if (this.isToDeclaration()) {
+        methods.push(this.parseToDeclaration());
+        return;
+      }
+      if (this.check(TokenType.FORGE)) {
+        fields.push(this.parseForgeStatement(false));
+        return;
+      }
+      if (this.isContextualFixedStart()) {
+        fields.push(this.parseForgeStatement(true));
+        return;
+      }
+      if (this.checkIdentifierValue('set') && this.isSetToStatement()) {
+        const st = this.parseSetToStatement();
+        if (st.type === 'AssignStatement') {
+          fields.push({ type: 'LetStatement', name: st.name, value: st.value, line: st.line });
+        }
+        return;
+      }
+      if (this.check(TokenType.PASS)) {
+        this.advance();
+        return;
+      }
+      this.advance();
+    };
+
+    if (this.check(TokenType.DOUBLE_COLON)) {
+      this.advance();
+      while (!this.check(TokenType.DOUBLE_SEMI) && !this.isAtEnd()) {
+        readClassRefineItem();
+      }
+      this.consume(TokenType.DOUBLE_SEMI, "Expected ';;'");
+    } else {
+      while (!this.isAtEnd() && !this.checkEndWord() && !this.check(TokenType.DOUBLE_SEMI)) {
+        readClassRefineItem();
+      }
+      if (this.checkEndWord()) this.advance();
+    }
+
+    return {
+      type: 'RefineDeclaration',
+      targetName,
+      isFunctionRefine: false,
+      methods,
+      fields,
+      line: refineToken.line,
+    };
+  }
+
+  private lastBlockConsumedEnd = false;
+
+  // ponder condition :: body ;; [elsewise cond :: ;;] [otherwise :: body ;;]
+  private parsePonderStatement(): AST.IfStatement {
+    const ponderToken = this.consume(TokenType.PONDER, "Expected 'ponder'");
+    const condition = this.parseExpression();
+    const thenBranch = this.parseBlockStatement();
+    const closedByEnd = this.lastBlockConsumedEnd;
+
+    let elseBranch: AST.BlockStatement | AST.IfStatement | undefined;
+    if (!closedByEnd && this.check(TokenType.ELIF)) {
+      elseBranch = this.parseElifChain();
+    } else if (!closedByEnd && this.match(TokenType.OTHERWISE)) {
+      const otherwiseToken = this.previous();
+      if (this.check(TokenType.PONDER) && this.peek().line === otherwiseToken.line) {
+        elseBranch = this.parsePonderStatement();
+      } else {
+        elseBranch = this.parseBlockStatement();
+      }
+    }
+
+    return { type: 'IfStatement', condition, thenBranch, elseBranch, line: ponderToken.line };
+  }
+
+  private parseElifChain(): AST.IfStatement {
+    const t = this.consume(TokenType.ELIF, "Expected 'elif'");
+    const condition = this.parseExpression();
+    const thenBranch = this.parseBlockStatement();
+    const closedByEnd = this.lastBlockConsumedEnd;
+    let elseBranch: AST.BlockStatement | AST.IfStatement | undefined;
+    if (!closedByEnd && this.check(TokenType.ELIF)) elseBranch = this.parseElifChain();
+    else if (!closedByEnd && this.match(TokenType.OTHERWISE)) elseBranch = this.parseBlockStatement();
+    return { type: 'IfStatement', condition, thenBranch, elseBranch, line: t.line };
+  }
+
+  // cycle condition :: body ;; [otherwise :: body ;;]
+  private parseCycleStatement(): AST.WhileStatement {
+    const cycleToken = this.consume(TokenType.CYCLE, "Expected 'cycle'");
+    const condition = this.parseExpression();
+    const body = this.parseBlockStatement();
+    let elseBlock: AST.BlockStatement | undefined;
+    if (this.check(TokenType.OTHERWISE) && this.tokens[this.pos + 1]?.type === TokenType.DOUBLE_COLON) {
+      this.advance();
+      elseBlock = this.parseBlockStatement();
+    }
+    return { type: 'WhileStatement', condition, body, elseBlock, line: cycleToken.line };
+  }
+
+  // iterate item[, item2] through list :: body ;; [otherwise :: ;;]
+  private parseIterateStatement(): AST.ForEachStatement {
+    const iterateToken = this.consume(TokenType.ITERATE, "Expected 'iterate'");
+    // `for each n in xs` reads the same as `for n in xs` — the word "each" is
+    // decoration, so skip it when a real variable name follows.
+    if (this.peek().value === 'each' && this.tokens[this.pos + 1]?.type !== TokenType.THROUGH && this.tokens[this.pos + 1]?.type !== TokenType.WITHIN) this.advance();
+    const variables: string[] = [this.consumeName('Expected variable name')];
+    while (this.match(TokenType.COMMA)) variables.push(this.consumeName('Expected variable name'));
+    // `in` can reach here lexed as `within` (e.g. `for i in range(…)`).
+    if (!this.match(TokenType.WITHIN)) this.consume(TokenType.THROUGH, "Expected 'through'");
+    const iterable = this.parseExpressionOrTuple();
+    const body = this.parseBlockStatement();
+    let elseBlock: AST.BlockStatement | undefined;
+    if (this.check(TokenType.OTHERWISE) && this.tokens[this.pos + 1]?.type === TokenType.DOUBLE_COLON) {
+      this.advance();
+      elseBlock = this.parseBlockStatement();
+    }
+    return {
+      type: 'ForEachStatement',
+      variable: variables[0],
+      variables: variables.length > 1 ? variables : undefined,
+      iterable,
+      body,
+      elseBlock,
+      line: iterateToken.line,
+    };
+  }
+
+  // within item be iterable :: body ;;
+  private parseWithinStatement(): AST.ForInStatement {
+    const withinToken = this.consume(TokenType.WITHIN, "Expected 'within'");
+    const variable = this.consumeName('Expected variable name');
+    this.consume(TokenType.BE, "Expected 'be'");
+    const iterable = this.parseExpression();
+    const body = this.parseBlockStatement();
+    return { type: 'ForInStatement', variable, iterable, body, line: withinToken.line };
+  }
+
+  // weave expr [as name], ... :: body ;;
+  private parseWithStatement(isAsync: boolean): AST.WithStatement {
+    const t = this.consume(TokenType.WITH, "Expected 'with'");
+    const items: AST.WithItem[] = [];
+    do {
+      const expr = this.parseExpression();
+      let alias: string | undefined;
+      if (this.match(TokenType.AS)) alias = this.consumeName('Expected binding name');
+      items.push({ expr, alias });
+    } while (this.match(TokenType.COMMA));
+    const body = this.parseBlockStatement();
+    return { type: 'WithStatement', items, body, isAsync, line: t.line };
+  }
+
+  // sift subject :: omen pattern [when guard] :: body ;; ... ;;
+  private parseMatchStatement(): AST.MatchStatement {
+    const t = this.consume(TokenType.MATCH, "Expected 'match'");
+    const subject = this.parseExpressionOrTuple();
+    this.consume(TokenType.DOUBLE_COLON, "Expected '::' to open the match block");
+    const cases: AST.MatchCase[] = [];
+    while (!this.check(TokenType.DOUBLE_SEMI) && !this.isAtEnd()) {
+      this.consume(TokenType.CASE, "Expected 'case' inside a match block");
+      const pattern = this.parsePattern();
+      let guard: AST.ASTNode | undefined;
+      if (this.match(TokenType.WHEN)) guard = this.parseExpression();
+      const body = this.parseBlockStatement();
+      cases.push({ pattern, guard, body });
+    }
+    this.consume(TokenType.DOUBLE_SEMI, "Expected ';;' to close the match block");
+    return { type: 'MatchStatement', subject, cases, line: t.line };
+  }
+
+  private parsePattern(): AST.PatternNode {
+    let pat = this.parsePatternPrimary();
+    if (this.check(TokenType.BAR)) {
+      const options = [pat];
+      while (this.match(TokenType.BAR)) options.push(this.parsePatternPrimary());
+      pat = { type: 'PatOr', options, line: pat.line };
+    }
+    if (this.match(TokenType.AS)) {
+      const name = this.consumeName('Expected capture name');
+      pat = { type: 'PatCapture', name, pattern: pat, line: pat.line };
+    }
+    return pat;
+  }
+
+  private parsePatternPrimary(): AST.PatternNode {
+    const t = this.peek();
+
+    // Wildcard `_`
+    if (t.type === TokenType.IDENTIFIER && t.value === '_') {
+      this.advance();
+      return { type: 'PatWildcard', line: t.line };
+    }
+
+    // Sequence pattern [a, b, *rest]
+    if (this.match(TokenType.LBRACKET)) {
+      const elements: AST.PatternNode[] = [];
+      let restIndex: number | undefined;
+      let restName: string | undefined;
+      if (!this.check(TokenType.RBRACKET)) {
+        do {
+          if (this.check(TokenType.RBRACKET)) break;
+          if (this.match(TokenType.STAR)) {
+            restIndex = elements.length;
+            restName = this.consumeName('Expected rest name');
+            continue;
+          }
+          elements.push(this.parsePattern());
+        } while (this.match(TokenType.COMMA));
+      }
+      this.consume(TokenType.RBRACKET, "Expected ']'");
+      return { type: 'PatSequence', elements, restIndex, restName, line: t.line };
+    }
+
+    // Mapping pattern { "k": pat, **rest }
+    if (this.match(TokenType.LBRACE)) {
+      const entries: { key: AST.ASTNode; pattern: AST.PatternNode }[] = [];
+      let restName: string | undefined;
+      if (!this.check(TokenType.RBRACE)) {
+        do {
+          if (this.check(TokenType.RBRACE)) break;
+          if (this.match(TokenType.STARSTAR)) {
+            restName = this.consumeName('Expected rest name');
+            continue;
+          }
+          let key: AST.ASTNode;
+          const kt = this.peek();
+          if (kt.type === TokenType.IDENTIFIER && this.tokens[this.pos + 1]?.type === TokenType.COLON) {
+            this.advance();
+            key = { type: 'StringLiteral', value: kt.value, line: kt.line };
+          } else {
+            key = this.parseExpression();
+          }
+          this.consume(TokenType.COLON, "Expected ':' in mapping pattern");
+          entries.push({ key, pattern: this.parsePattern() });
+        } while (this.match(TokenType.COMMA));
+      }
+      this.consume(TokenType.RBRACE, "Expected '}'");
+      return { type: 'PatMapping', entries, restName, line: t.line };
+    }
+
+    // Literals
+    if (this.check(TokenType.NUMBER) || this.check(TokenType.STRING) ||
+      this.check(TokenType.YEP) || this.check(TokenType.NOPE) || this.check(TokenType.VOID)) {
+      const value = this.parseUnary();
+      return { type: 'PatLiteral', value, line: t.line };
+    }
+    if (this.check(TokenType.MINUS)) {
+      const value = this.parseUnary();
+      return { type: 'PatLiteral', value, line: t.line };
+    }
+
+    // Identifier: capture, dotted value, or class pattern
+    if (this.check(TokenType.IDENTIFIER)) {
+      const name = this.advance().value;
+      // Class pattern Name(...)
+      if (this.check(TokenType.LPAREN)) {
+        this.advance();
+        const positional: AST.PatternNode[] = [];
+        const keywords: { name: string; pattern: AST.PatternNode }[] = [];
+        if (!this.check(TokenType.RPAREN)) {
+          do {
+            if (this.check(TokenType.RPAREN)) break;
+            if (this.check(TokenType.IDENTIFIER) && this.tokens[this.pos + 1]?.type === TokenType.BE) {
+              const kw = this.advance().value;
+              this.advance(); // be
+              keywords.push({ name: kw, pattern: this.parsePattern() });
+            } else {
+              positional.push(this.parsePattern());
+            }
+          } while (this.match(TokenType.COMMA));
+        }
+        this.consume(TokenType.RPAREN, "Expected ')'");
+        return { type: 'PatClass', className: name, positional, keywords, line: t.line };
+      }
+      // Dotted value pattern Colour.RED
+      if (this.check(TokenType.DOT)) {
+        let expr: AST.ASTNode = { type: 'Identifier', name, line: t.line };
+        while (this.match(TokenType.DOT)) {
+          const prop = this.consumeName('Expected property name');
+          expr = { type: 'MemberExpr', object: expr, property: prop, line: t.line };
+        }
+        return { type: 'PatValue', expr, line: t.line };
+      }
+      return { type: 'PatCapture', name, line: t.line };
+    }
+
+    throw new SdevError(`Invalid pattern near '${t.value}'`, t.line, t.column);
+  }
+
+  // hurl Error("boom") [from cause]
+  private parseRaiseStatement(): AST.RaiseStatement {
+    const t = this.consume(TokenType.RAISE, "Expected 'raise'");
+    let error: AST.ASTNode | undefined;
+    let cause: AST.ASTNode | undefined;
+    if (!this.atStatementEnd()) {
+      error = this.parseExpression();
+      if (this.match(TokenType.FROM)) cause = this.parseExpression();
+    }
+    return { type: 'RaiseStatement', error, cause, line: t.line };
+  }
+
+  // insist condition, "message"
+  private parseAssertStatement(): AST.AssertStatement {
+    const t = this.consume(TokenType.ASSERT, "Expected 'assert'");
+    const condition = this.parseExpression();
+    let message: AST.ASTNode | undefined;
+    if (this.match(TokenType.COMMA)) message = this.parseExpression();
+    return { type: 'AssertStatement', condition, message, line: t.line };
+  }
+
+  // banish target[, target]
+  private parseDelStatement(): AST.DelStatement {
+    const t = this.consume(TokenType.DEL, "Expected 'del'");
+    const targets: AST.ASTNode[] = [];
+    do {
+      targets.push(this.parseExpression());
+    } while (this.match(TokenType.COMMA));
+    return { type: 'DelStatement', targets, line: t.line };
+  }
+
+  private parseScopeStatement(): AST.ScopeStatement {
+    const t = this.advance();
+    const scope = t.type === TokenType.GLOBAL ? 'global' : 'nonlocal';
+    const names: string[] = [];
+    do {
+      names.push(this.consumeName('Expected a name'));
+    } while (this.match(TokenType.COMMA));
+    return { type: 'ScopeStatement', scope, names, line: t.line };
+  }
+
+  // summon "gist-id"  |  import module [as alias]
+  private parseImportStatement(): AST.ASTNode {
+    const t = this.consume(TokenType.SUMMON, "Expected 'import'");
+    if (this.check(TokenType.STRING)) {
+      const module = this.advance().value;
+      let alias: string | undefined;
+      if (this.match(TokenType.AS)) alias = this.consumeName('Expected alias');
+      return { type: 'ImportStatement', module, alias, isFrom: false, line: t.line };
+    }
+    const parts = [this.consumeName('Expected module name')];
+    while (this.match(TokenType.DOT)) parts.push(this.consumeName('Expected module name'));
+    let alias: string | undefined;
+    if (this.match(TokenType.AS)) alias = this.consumeName('Expected alias');
+    return { type: 'ImportStatement', module: parts.join('.'), alias, isFrom: false, line: t.line };
+  }
+
+  // from module import a [as b], c   |  from "file.sdev" import x
+  private parseFromImportStatement(): AST.ImportStatement {
+    const t = this.consume(TokenType.FROM, "Expected 'from'");
+    let module: string;
+    if (this.check(TokenType.STRING)) module = this.advance().value;
+    else {
+      const parts = [this.consumeName('Expected module name')];
+      while (this.match(TokenType.DOT)) parts.push(this.consumeName('Expected module name'));
+      module = parts.join('.');
+    }
+    this.consume(TokenType.SUMMON, "Expected 'import' after module name");
+    const names: { name: string; alias?: string }[] = [];
+    if (this.check(TokenType.STAR)) {
+      this.advance();
+      return { type: 'ImportStatement', module, names: undefined, isFrom: true, line: t.line };
+    }
+    do {
+      const name = this.consumeName('Expected imported name');
+      let alias: string | undefined;
+      if (this.match(TokenType.AS)) alias = this.consumeName('Expected alias');
+      names.push({ name, alias });
+    } while (this.match(TokenType.COMMA));
+    return { type: 'ImportStatement', module, names, isFrom: true, line: t.line };
+  }
+
+  // yield value
+  private parseYieldStatement(): AST.ReturnStatement {
+    const yieldToken = this.consume(TokenType.YIELD, "Expected 'yield'");
+    let value: AST.ASTNode | undefined;
+    if (!this.atStatementEnd()) {
+      value = this.parseExpressionOrTuple();
+    }
+    return { type: 'ReturnStatement', value, line: yieldToken.line };
+  }
+
+  private atStatementEnd(): boolean {
+    if (this.isAtEnd()) return true;
+    const t = this.peek();
+    return t.type === TokenType.DOUBLE_SEMI ||
+      t.type === TokenType.FORGE || t.type === TokenType.CONJURE ||
+      t.type === TokenType.PONDER || t.type === TokenType.CYCLE ||
+      t.type === TokenType.ITERATE || t.type === TokenType.YIELD ||
+      t.type === TokenType.CASE ||
+      this.isContextualFeatureStart() || this.isContextualRefineStart();
+  }
+
+  // yeet (break)
+  private parseYeetStatement(): AST.BreakStatement {
+    const t = this.consume(TokenType.YEET, "Expected 'yeet'");
+    return { type: 'BreakStatement', line: t.line };
+  }
+
+  // skip (continue)
+  private parseSkipStatement(): AST.ContinueStatement {
+    const t = this.consume(TokenType.SKIP, "Expected 'skip'");
+    return { type: 'ContinueStatement', line: t.line };
+  }
+
+  // attempt :: ;; rescue [Type[, Type]] [as e] :: ;; [otherwise :: ;;] [ensure :: ;;]
+  private parseAttemptStatement(): AST.TryStatement {
+    const attemptToken = this.consume(TokenType.ATTEMPT, "Expected 'attempt'");
+    const tryBlock = this.parseBlockStatement();
+
+    const handlers: AST.ExceptHandler[] = [];
+    while (this.check(TokenType.RESCUE)) {
+      const rescueTok = this.advance();
+      const star = this.match(TokenType.STAR);
+      const types: AST.ASTNode[] = [];
+      let alias: string | undefined;
+
+      if (!this.check(TokenType.DOUBLE_COLON) && !this.isAtEnd() && this.peek().line === rescueTok.line) {
+        // Legacy / v2 form: `rescue err ::` or `rescue err\n` binds a lowercase name.
+        const first = this.peek();
+        const nextTok = this.tokens[this.pos + 1];
+        const legacyBind =
+          first.type === TokenType.IDENTIFIER &&
+          /^[a-z_]/.test(first.value) &&
+          (nextTok?.type === TokenType.DOUBLE_COLON || !nextTok || nextTok.line > rescueTok.line);
+        if (legacyBind) {
+          alias = this.advance().value;
+        } else {
+          do {
+            if (this.check(TokenType.DOUBLE_COLON)) break;
+            types.push(this.parseCall());
+          } while (this.match(TokenType.COMMA));
+          if (this.match(TokenType.AS)) alias = this.consumeName('Expected error name');
+        }
+      }
+      const body = this.parseBlockStatement();
+      handlers.push({ types, alias, body, star });
+    }
+
+    let elseBlock: AST.BlockStatement | undefined;
+    if (this.check(TokenType.OTHERWISE) && this.tokens[this.pos + 1]?.type === TokenType.DOUBLE_COLON) {
+      this.advance();
+      elseBlock = this.parseBlockStatement();
+    }
+
+    let finallyBlock: AST.BlockStatement | undefined;
+    if (this.match(TokenType.FINALLY)) finallyBlock = this.parseBlockStatement();
+
+    if (handlers.length === 0 && !finallyBlock) {
+      throw new SdevError("Expected 'rescue' or 'ensure' after attempt block", attemptToken.line);
+    }
+
+    return {
+      type: 'TryStatement',
+      tryBlock,
+      errorVar: handlers[0]?.alias ?? '_error',
+      catchBlock: handlers[0]?.body ?? { type: 'BlockStatement', statements: [], line: attemptToken.line },
+      handlers,
+      elseBlock,
+      finallyBlock,
+      line: attemptToken.line,
+    };
+  }
+
+  // :: statements ;;
+  private parseBlockStatement(): AST.BlockStatement {
+    // Natural block form: no `::`, statements run until `end` (or `else`).
+    if (!this.check(TokenType.DOUBLE_COLON)) {
+      const start = this.peek();
+      const statements: AST.ASTNode[] = [];
+      while (
+        !this.isAtEnd() &&
+        !this.checkEndWord() &&
+        !this.check(TokenType.DOUBLE_SEMI) &&
+        !this.check(TokenType.OTHERWISE) &&
+        !this.checkIdentifierValue('else') &&
+        !this.check(TokenType.RESCUE) &&
+        !this.check(TokenType.FINALLY)
+      ) {
+        statements.push(this.parseStatement());
+      }
+      const consumedEnd = this.checkEndWord();
+      if (consumedEnd) this.advance();
+      this.lastBlockConsumedEnd = consumedEnd;
+      return { type: 'BlockStatement', statements, line: start.line };
+    }
+    const colonToken = this.consume(TokenType.DOUBLE_COLON, "Expected '::'");
+    const statements: AST.ASTNode[] = [];
+    while (!this.check(TokenType.DOUBLE_SEMI) && !this.isAtEnd()) {
+      statements.push(this.parseStatement());
+    }
+    this.consume(TokenType.DOUBLE_SEMI, "Expected ';;'");
+    this.lastBlockConsumedEnd = false;
+    return { type: 'BlockStatement', statements, line: colonToken.line };
+  }
+
+  /**
+   * Paren-less output commands: `say x`, `speak "hi"`, `shout a, b`.
+   * Only the output family is command-style, so ordinary expressions
+   * keep their existing meaning.
+   */
+  private tryParseCommandCall(): AST.ASTNode | null {
+    const COMMANDS = new Set(['say', 'speak', 'whisper', 'shout', 'print']);
+    const head = this.peek();
+    if (head.type !== TokenType.IDENTIFIER || !COMMANDS.has(head.value)) return null;
+    const next = this.tokens[this.pos + 1];
+    if (!next || next.line !== head.line) return null;
+    const STARTERS = new Set([
+      TokenType.STRING,
+      TokenType.NUMBER,
+      TokenType.IDENTIFIER,
+      TokenType.LBRACKET,
+      TokenType.MINUS,
+      TokenType.YEP,
+      TokenType.NOPE,
+      TokenType.VOID,
+      TokenType.SELF,
+      TokenType.ISNT,
+    ]);
+    if (!STARTERS.has(next.type)) return null;
+    // `say to ...` / `say be ...` are not calls; a following 'to' means a set-form.
+    if (next.type === TokenType.IDENTIFIER && (next.value === 'to' || next.value === 'be')) return null;
+    this.advance();
+    const args: AST.ASTNode[] = [this.parseExpression()];
+    while (this.match(TokenType.COMMA)) args.push(this.parseExpression());
+    return {
+      type: 'CallExpr',
+      callee: { type: 'Identifier', name: head.value, line: head.line },
+      args,
+      line: head.line,
+    } as AST.ASTNode;
+  }
+
+  private parseExpressionStatement(): AST.ASTNode {
+    const command = this.tryParseCommandCall();
+    if (command) return command;
+    const expr = this.parseExpression();
+
+    // Augmented assignment: target += value
+    if (this.check(TokenType.AUGASSIGN)) {
+      const op = this.advance().value.slice(0, -1);
+      const value = this.parseExpression();
+      return { type: 'AugAssignStatement', target: expr, operator: op, value, line: expr.line };
+    }
+
+    // Multi-target destructuring: a, b be pair
+    if (this.check(TokenType.COMMA) && expr.type === 'Identifier') {
+      const save = this.pos;
+      const names = [expr.name];
+      let ok = true;
+      let starIndex: number | undefined;
+      while (this.match(TokenType.COMMA)) {
+        if (this.check(TokenType.STAR)) { this.advance(); starIndex = names.length; }
+        if (!this.check(TokenType.IDENTIFIER)) { ok = false; break; }
+        names.push(this.advance().value);
+      }
+      if (ok && this.check(TokenType.BE)) {
+        this.advance();
+        const value = this.parseExpressionOrTuple();
+        return { type: 'LetStatement', name: names[0], targets: names, starIndex, value, line: expr.line };
+      }
+      this.pos = save;
+    }
+
+    // Check for assignment with 'be'. Only assignable targets consume the
+    // 'be' — otherwise the token belongs to a following `be x be ...`
+    // statement on the next line.
+    const assignable =
+      expr.type === 'Identifier' || expr.type === 'IndexExpr' || expr.type === 'MemberExpr' ||
+      expr.type === 'SliceExpr';
+    if (assignable && this.check(TokenType.BE)) {
+      this.advance();
+      const value = this.parseExpressionOrTuple();
+      if (expr.type === 'SliceExpr') {
+        return {
+          type: 'ExpressionStatement', expression: {
+            type: 'CallExpr',
+            callee: { type: 'Identifier', name: 'slice_assign', line: expr.line },
+            args: [expr.object, expr.start ?? { type: 'NullLiteral', line: expr.line }, expr.stop ?? { type: 'NullLiteral', line: expr.line }, expr.step ?? { type: 'NullLiteral', line: expr.line }, value],
+            line: expr.line,
+          }, line: expr.line
+        };
+      }
+      return this.makeAssignment(expr, value, expr.line);
+    }
+
+    return { type: 'ExpressionStatement', expression: expr, line: expr.line };
+  }
+
+  // ==========================================================
+  // Expressions
+  // ==========================================================
+
+  /** Parses `a, b, c` into a tuple when commas appear at top level. */
+  private parseExpressionOrTuple(): AST.ASTNode {
+    const first = this.parseExpression();
+    if (!this.check(TokenType.COMMA)) return first;
+    const elements = [first];
+    while (this.match(TokenType.COMMA)) {
+      if (this.atStatementEnd() || this.check(TokenType.RPAREN)) break;
+      elements.push(this.parseExpression());
+    }
+    return { type: 'TupleLiteral', elements, line: first.line };
+  }
+
+  private parseExpression(): AST.ASTNode {
+    return this.parseWalrus();
+  }
+
+  private parseWalrus(): AST.ASTNode {
+    if (this.check(TokenType.IDENTIFIER) && this.tokens[this.pos + 1]?.type === TokenType.WALRUS) {
+      const name = this.advance().value;
+      const t = this.advance();
+      const value = this.parseWalrus();
+      return { type: 'WalrusExpr', name, value, line: t.line };
+    }
+    return this.parseTernary();
+  }
+
+  // Ternary: condition ~ thenExpr : elseExpr
+  private parseTernary(): AST.ASTNode {
+    const left = this.parsePipe();
+    if (this.match(TokenType.TILDE)) {
+      const thenExpr = this.parsePipe();
+      this.consume(TokenType.COLON, "Expected ':' in ternary expression");
+      const elseExpr = this.parsePipe();
+      return { type: 'TernaryExpr', condition: left, thenExpr, elseExpr, line: left.line };
+    }
+    return left;
+  }
+
+  // Pipe operator |>
+  private parsePipe(): AST.ASTNode {
+    let left = this.parseLambdaExpr();
+
+    while (this.match(TokenType.PIPE)) {
+      const right = this.parseLambdaExpr();
+      if (right.type === 'CallExpr') {
+        right.args.unshift(left);
+        left = right;
+      } else {
+        left = { type: 'CallExpr', callee: right, args: [left], line: left.line };
+      }
+    }
+
+    return left;
+  }
+
+  // lambda a, b: expr    |    spell a, b :: block ;;
+  private parseLambdaExpr(): AST.ASTNode {
+    if (this.check(TokenType.LAMBDA)) {
+      const t = this.advance();
+      const params: AST.Param[] = [];
+      while (!this.check(TokenType.COLON) && !this.check(TokenType.DOUBLE_COLON) && !this.isAtEnd()) {
+        let kind: AST.Param['kind'] = 'normal';
+        if (this.match(TokenType.STARSTAR)) kind = 'named';
+        else if (this.match(TokenType.STAR)) kind = 'rest';
+        const name = this.consumeName('Expected lambda parameter');
+        let def: AST.ASTNode | undefined;
+        if (this.match(TokenType.BE)) def = this.parseExpression();
+        params.push({ name, kind, default: def });
+        if (!this.match(TokenType.COMMA)) break;
+      }
+      let body: AST.ASTNode;
+      if (this.check(TokenType.DOUBLE_COLON)) body = this.parseBlockStatement();
+      else {
+        this.consume(TokenType.COLON, "Expected ':' in lambda");
+        body = this.parseExpression();
+      }
+      return {
+        type: 'LambdaExpr',
+        params: params.map((p) => p.name),
+        paramSpecs: params,
+        body,
+        line: t.line,
+      };
+    }
+    return this.parseOr();
+  }
+
+  private parseOr(): AST.ASTNode {
+    let left = this.parseAnd();
+    // `either` is the OR operator, but it also opens a guard statement. Only
+    // continue the expression when the token sits on the same line as the
+    // operand — a leading `either` on a new line starts a statement.
+    while (this.check(TokenType.EITHER) && this.peek().line === this.previous().line) {
+      this.advance();
+      const right = this.parseAnd();
+      left = { type: 'BinaryExpr', operator: 'either', left, right, line: left.line };
+    }
+    return left;
+  }
+
+  private parseAnd(): AST.ASTNode {
+    let left = this.parseNot();
+    while (this.match(TokenType.ALSO)) {
+      const right = this.parseNot();
+      left = { type: 'BinaryExpr', operator: 'also', left, right, line: left.line };
+    }
+    return left;
+  }
+
+  /** `not x` at boolean precedence (Python's `not`). */
+  private parseNot(): AST.ASTNode {
+    if (this.check(TokenType.ISNT) && this.tokens[this.pos + 1]?.type !== TokenType.THROUGH) {
+      const t = this.advance();
+      const operand = this.parseNot();
+      return { type: 'UnaryExpr', operator: 'isnt', operand, line: t.line };
+    }
+    return this.parseEquality();
+  }
+
+  private parseEquality(): AST.ASTNode {
+    let left = this.parseComparison();
+    while (this.match(TokenType.EQUALS, TokenType.DIFFERS)) {
+      const operator = this.previous().type === TokenType.EQUALS ? 'equals' : 'differs';
+      const right = this.parseComparison();
+      left = { type: 'BinaryExpr', operator, left, right, line: left.line };
+    }
+    return left;
+  }
+
+  /** Comparison chain: `1 < x < 10` lowers to `1 < x also x < 10`. */
+  private parseComparison(): AST.ASTNode {
+    const left = this.parseMembership();
+    const ops: { op: string; right: AST.ASTNode }[] = [];
+    while (this.match(TokenType.LESS, TokenType.MORE, TokenType.ATMOST, TokenType.ATLEAST)) {
+      const operator = this.previous().value;
+      const right = this.parseMembership();
+      ops.push({ op: operator === '<' || operator === '>' || operator === '<=' || operator === '>=' ? operator : operator, right });
+    }
+    if (ops.length === 0) return left;
+    if (ops.length === 1) {
+      return { type: 'BinaryExpr', operator: ops[0].op, left, right: ops[0].right, line: left.line };
+    }
+    // Chained: build `a < b also b < c ...`
+    let prev = left;
+    let result: AST.ASTNode | null = null;
+    for (const { op, right } of ops) {
+      const cmp: AST.ASTNode = { type: 'BinaryExpr', operator: op, left: prev, right, line: left.line };
+      result = result ? { type: 'BinaryExpr', operator: 'also', left: result, right: cmp, line: left.line } : cmp;
+      prev = right;
+    }
+    return result!;
+  }
+
+  /** `x through xs`, `x isnt through xs`, `a same b`, `a isnt same b`. */
+  private parseMembership(): AST.ASTNode {
+    let left = this.parseBitOr();
+    for (; ;) {
+      if (this.check(TokenType.THROUGH)) {
+        this.advance();
+        const right = this.parseBitOr();
+        left = { type: 'BinaryExpr', operator: 'in', left, right, line: left.line };
+        continue;
+      }
+      if (this.check(TokenType.IS)) {
+        this.advance();
+        const negated = this.match(TokenType.ISNT);
+        const right = this.parseBitOr();
+        left = { type: 'BinaryExpr', operator: negated ? 'is not' : 'is', left, right, line: left.line };
+        continue;
+      }
+      if (this.check(TokenType.ISNT) && this.tokens[this.pos + 1]?.type === TokenType.THROUGH) {
+        this.advance();
+        this.advance();
+        const right = this.parseBitOr();
+        left = { type: 'BinaryExpr', operator: 'not in', left, right, line: left.line };
+        continue;
+      }
+      break;
+    }
+    return left;
+  }
+
+  private parseBitOr(): AST.ASTNode {
+    let left = this.parseBitXor();
+    while (this.check(TokenType.BAR)) {
+      this.advance();
+      const right = this.parseBitXor();
+      left = { type: 'BinaryExpr', operator: '|', left, right, line: left.line };
+    }
+    return left;
+  }
+
+  private parseBitXor(): AST.ASTNode {
+    const left = this.parseBitAnd();
+    // '^' is power in sdev; bitwise xor is the `bit_xor` builtin.
+    return left;
+  }
+
+  private parseBitAnd(): AST.ASTNode {
+    let left = this.parseShift();
+    while (this.check(TokenType.AMP)) {
+      this.advance();
+      const right = this.parseShift();
+      left = { type: 'BinaryExpr', operator: '&', left, right, line: left.line };
+    }
+    return left;
+  }
+
+  private parseShift(): AST.ASTNode {
+    let left = this.parseTerm();
+    while (this.check(TokenType.SHL) || this.check(TokenType.SHR)) {
+      const op = this.advance().value;
+      const right = this.parseTerm();
+      left = { type: 'BinaryExpr', operator: op, left, right, line: left.line };
+    }
+    return left;
+  }
+
+  private parseTerm(): AST.ASTNode {
+    let left = this.parseFactor();
+    while (this.match(TokenType.PLUS, TokenType.MINUS)) {
+      const operator = this.previous().value;
+      const right = this.parseFactor();
+      left = { type: 'BinaryExpr', operator, left, right, line: left.line };
+    }
+    return left;
+  }
+
+  private parseFactor(): AST.ASTNode {
+    let left = this.parsePower();
+    while (this.match(TokenType.STAR, TokenType.SLASH, TokenType.PERCENT, TokenType.BACKSLASH, TokenType.AT)) {
+      const tok = this.previous();
+      const operator = tok.type === TokenType.BACKSLASH ? '\\' : tok.type === TokenType.AT ? '@' : tok.value;
+      const right = this.parsePower();
+      left = { type: 'BinaryExpr', operator, left, right, line: left.line };
+    }
+    return left;
+  }
+
+  private parsePower(): AST.ASTNode {
+    const left = this.parseUnary();
+    if (this.match(TokenType.CARET, TokenType.STARSTAR)) {
+      const right = this.parsePower(); // right-associative
+      return { type: 'BinaryExpr', operator: '^', left, right, line: left.line };
+    }
+    return left;
+  }
+
+  private parseUnary(): AST.ASTNode {
+    if (this.match(TokenType.MINUS, TokenType.ISNT)) {
+      const operator = this.previous().value === '-' ? '-' : 'isnt';
+      const line = this.previous().line;
+      const operand = this.parseUnary();
+      return { type: 'UnaryExpr', operator, operand, line };
+    }
+    if (this.match(TokenType.PLUS)) {
+      return this.parseUnary();
+    }
+    // await expression
+    if (this.match(TokenType.AWAIT)) {
+      const awaitLine = this.previous().line;
+      const operand = this.parseUnary();
+      return { type: 'AwaitExpr', operand, line: awaitLine };
+    }
+    // generator emit / delegate as an expression
+    if (this.check(TokenType.EMIT) || this.check(TokenType.DELEGATE)) {
+      const t = this.advance();
+      const delegate = t.type === TokenType.DELEGATE;
+      let value: AST.ASTNode | undefined;
+      if (!this.atStatementEnd() && !this.check(TokenType.RPAREN) && !this.check(TokenType.RBRACKET)) {
+        value = this.parseExpression();
+      }
+      return { type: 'EmitExpr', value, delegate, line: t.line };
+    }
+    return this.parseCall();
+  }
+
+  private parseCall(): AST.ASTNode {
+    let expr = this.parsePrimary();
+
+    for (; ;) {
+      if (this.match(TokenType.LPAREN)) {
+        expr = this.finishCall(expr);
+      } else if (this.match(TokenType.LBRACKET)) {
+        expr = this.finishSubscript(expr);
+      } else if (this.match(TokenType.DOT)) {
+        const property = this.consumeName('Expected property name');
+        expr = { type: 'MemberExpr', object: expr, property, line: expr.line };
+      } else if (this.check(TokenType.ARROW) && expr.type === 'Identifier') {
+        // Lambda: x -> expr
+        this.advance();
+        let body: AST.ASTNode;
+        if (this.check(TokenType.DOUBLE_COLON)) body = this.parseBlockStatement();
+        else body = this.parseExpression();
+        expr = { type: 'LambdaExpr', params: [expr.name], body, line: expr.line };
+      } else {
+        break;
+      }
+    }
+
+    return expr;
+  }
+
+  /** `xs[i]`, `xs[a:b]`, `xs[a:b:c]` */
+  private finishSubscript(object: AST.ASTNode): AST.ASTNode {
+    const line = object.line;
+    let start: AST.ASTNode | undefined;
+    if (!this.check(TokenType.COLON)) start = this.parseExpression();
+
+    if (this.check(TokenType.COLON)) {
+      this.advance();
+      let stop: AST.ASTNode | undefined;
+      let step: AST.ASTNode | undefined;
+      if (!this.check(TokenType.COLON) && !this.check(TokenType.RBRACKET)) stop = this.parseExpression();
+      if (this.match(TokenType.COLON)) {
+        if (!this.check(TokenType.RBRACKET)) step = this.parseExpression();
+      }
+      this.consume(TokenType.RBRACKET, "Expected ']'");
+      return { type: 'SliceExpr', object, start, stop, step, line };
+    }
+
+    this.consume(TokenType.RBRACKET, "Expected ']'");
+    return { type: 'IndexExpr', object, index: start!, line };
+  }
+
+  private finishCall(callee: AST.ASTNode): AST.ASTNode {
+    const args: AST.ASTNode[] = [];
+    if (!this.check(TokenType.RPAREN)) {
+      do {
+        if (this.check(TokenType.RPAREN)) break;
+        // **kwargs spread
+        if (this.match(TokenType.STARSTAR)) {
+          args.push({ type: 'StarExpr', operand: this.parseExpression(), double: true, line: callee.line });
+          continue;
+        }
+        // *args spread
+        if (this.match(TokenType.STAR)) {
+          args.push({ type: 'StarExpr', operand: this.parseExpression(), double: false, line: callee.line });
+          continue;
+        }
+        // keyword argument:  name be value  |  name: value
+        if ((this.check(TokenType.IDENTIFIER) || /^[A-Za-z_$][\w$]*$/.test(this.peek().value)) &&
+          (this.tokens[this.pos + 1]?.type === TokenType.BE || this.tokens[this.pos + 1]?.type === TokenType.COLON)) {
+          const name = this.advance().value;
+          this.advance();
+          args.push({ type: 'KeywordArg', name, value: this.parseExpression(), line: callee.line });
+          continue;
+        }
+        const first = this.parseExpression();
+        // Generator expression as the sole argument: f(x iterate x through xs)
+        if (this.check(TokenType.ITERATE) && args.length === 0) {
+          const comp = this.finishComprehension(first, 'gen', undefined, callee.line);
+          this.consume(TokenType.RPAREN, "Expected ')'");
+          return { type: 'CallExpr', callee, args: [comp], line: callee.line };
+        }
+        args.push(first);
+      } while (this.match(TokenType.COMMA));
+    }
+    this.consume(TokenType.RPAREN, "Expected ')'");
+    const isPartialBuiltin =
+      callee.type === 'Identifier' && (callee.name === 'partial' || callee.name === 'partial_right');
+    const hasPlaceholder = args.some((a) => a.type === 'Identifier' && a.name === '_');
+    if (hasPlaceholder) {
+      if (isPartialBuiltin) {
+        const mappedArgs = args.map((a) =>
+          a.type === 'Identifier' && a.name === '_'
+            ? ({
+                type: 'DictLiteral',
+                entries: [
+                  {
+                    key: { type: 'StringLiteral', value: '__sdev_placeholder__', line: a.line },
+                    value: { type: 'BooleanLiteral', value: true, line: a.line },
+                  },
+                ],
+                line: a.line,
+              } as AST.DictLiteral)
+            : a
+        );
+        return { type: 'CallExpr', callee, args: mappedArgs, line: callee.line };
+      }
+      const placeholderParams: string[] = [];
+      const boundArgs = args.map((a) => {
+        if (a.type === 'Identifier' && a.name === '_') {
+          const pname = `__p${placeholderParams.length}`;
+          placeholderParams.push(pname);
+          return { type: 'Identifier', name: pname, line: a.line } as AST.Identifier;
+        }
+        return a;
+      });
+      return {
+        type: 'LambdaExpr',
+        params: placeholderParams,
+        paramSpecs: placeholderParams.map((p) => ({ name: p, kind: 'normal' })),
+        body: { type: 'CallExpr', callee, args: boundArgs, line: callee.line },
+        line: callee.line,
+      };
+    }
+    return { type: 'CallExpr', callee, args, line: callee.line };
+  }
+
+  /** Shared comprehension tail: `iterate v through xs [ponder cond]...` */
+  private finishComprehension(
+    element: AST.ASTNode,
+    form: 'list' | 'set' | 'dict' | 'gen',
+    valueExpr: AST.ASTNode | undefined,
+    line: number
+  ): AST.ComprehensionExpr {
+    const clauses: AST.ComprehensionClause[] = [];
+    while (this.check(TokenType.ITERATE) || this.check(TokenType.ASYNC)) {
+      let isAsync = false;
+      if (this.check(TokenType.ASYNC)) { this.advance(); isAsync = true; }
+      this.consume(TokenType.ITERATE, "Expected 'for' in comprehension");
+      const vars: string[] = [this.consumeName('Expected loop variable')];
+      while (this.match(TokenType.COMMA)) vars.push(this.consumeName('Expected loop variable'));
+      this.consume(TokenType.THROUGH, "Expected 'in' in comprehension");
+      const iterable = this.parseBitOr();
+      const conditions: AST.ASTNode[] = [];
+      while (this.check(TokenType.PONDER)) {
+        this.advance();
+        conditions.push(this.parseOr());
+      }
+      clauses.push({ variable: vars.length > 1 ? vars : vars[0], iterable, conditions, isAsync });
+    }
+    return { type: 'ComprehensionExpr', form, element, valueExpr, clauses, line };
+  }
+
+  private parsePrimary(): AST.ASTNode {
+    const token = this.peek();
+
+    if (this.match(TokenType.NUMBER)) {
+      return { type: 'NumberLiteral', value: parseFloat(token.value), line: token.line };
+    }
+
+    if (this.match(TokenType.STRING)) {
+      // Implicit adjacent string concatenation. Plain strings are always
+      // literal text — `{...}` is only a template inside f"..." strings, so
+      // JSON, regex quantifiers (`\d{3}`) and `\p{L}` stay exactly as written.
+      let value = token.value;
+      while (this.check(TokenType.STRING)) value += this.advance().value;
+      return { type: 'StringLiteral', value, line: token.line };
+    }
+
+    if (this.match(TokenType.FSTRING)) {
+      return this.buildFString(token.value, token.line);
+    }
+
+    if (this.match(TokenType.BYTES)) {
+      return { type: 'BytesLiteral', value: token.value, line: token.line };
+    }
+
+    if (this.match(TokenType.ELLIPSIS)) {
+      return { type: 'EllipsisLiteral', line: token.line };
+    }
+
+    if (this.match(TokenType.YEP)) return { type: 'BooleanLiteral', value: true, line: token.line };
+    if (this.match(TokenType.NOPE)) return { type: 'BooleanLiteral', value: false, line: token.line };
+    if (this.match(TokenType.VOID)) return { type: 'NullLiteral', line: token.line };
+
+    if (this.match(TokenType.SELF)) return { type: 'Identifier', name: 'self', line: token.line };
+    if (this.match(TokenType.SUPER)) return { type: 'Identifier', name: 'super', line: token.line };
+
+    if (this.checkIdentifierValue('nothing')) {
+      this.advance();
+      return { type: 'NullLiteral', line: token.line };
+    }
+
+    // v2 `ref NAME` — first-class function value
+    if (
+      this.checkIdentifierValue('ref') &&
+      this.tokens[this.pos + 1]?.type === TokenType.IDENTIFIER &&
+      this.tokens[this.pos + 1]?.line === token.line
+    ) {
+      this.advance();
+      const target = this.advance();
+      return { type: 'Identifier', name: target.value, line: target.line };
+    }
+
+    // v2 `call TARGET(args)` — indirect call through a function/closure value
+    if (
+      this.checkIdentifierValue('call') &&
+      this.tokens[this.pos + 1]?.type === TokenType.IDENTIFIER &&
+      this.tokens[this.pos + 2]?.type === TokenType.LPAREN
+    ) {
+      this.advance();
+      return this.parseCall();
+    }
+
+    // v2 `make [with p...] [capture c...] ... end` — closure expression
+    if (this.checkIdentifierValue('make')) {
+      const next = this.tokens[this.pos + 1];
+      const isMakeClosure =
+        !next ||
+        next.line > token.line ||
+        next.type === TokenType.WITH ||
+        (next.type === TokenType.IDENTIFIER && (next.value === 'with' || next.value === 'capture'));
+      if (isMakeClosure) {
+        this.advance();
+        const params: string[] = [];
+        if ((this.check(TokenType.WITH) || this.checkIdentifierValue('with')) && this.peek().line === token.line) {
+          this.advance();
+          while (this.check(TokenType.IDENTIFIER) && this.peek().line === token.line && !this.checkIdentifierValue('capture')) {
+            params.push(this.advance().value);
+            this.match(TokenType.COMMA);
+          }
+        }
+        if (this.checkIdentifierValue('capture') && this.peek().line === token.line) {
+          this.advance();
+          while (this.check(TokenType.IDENTIFIER) && this.peek().line === token.line) {
+            this.advance();
+            this.match(TokenType.COMMA);
+          }
+        }
+        const body = this.parseBlockStatement();
+        return { type: 'LambdaExpr', params, body, line: token.line };
+      }
+    }
+
+    if (this.match(TokenType.IDENTIFIER)) {
+      return { type: 'Identifier', name: token.value, line: token.line };
+    }
+
+    // Contextual keywords usable as plain values (`match`, `case`, `when`, `del`, ...)
+    if (this.check(TokenType.MATCH) || this.check(TokenType.WHEN) || this.check(TokenType.CASE) || this.check(TokenType.DEL)) {
+      const t = this.advance();
+      return { type: 'Identifier', name: t.value, line: t.line };
+    }
+
+    // new ClassName(args)
+    if (this.match(TokenType.NEW)) {
+      const classExpr = this.parseCall();
+      if (classExpr.type === 'CallExpr') {
+        return { type: 'NewExpr', className: classExpr.callee, args: classExpr.args, line: token.line };
+      }
+      return { type: 'NewExpr', className: classExpr, args: [], line: token.line };
+    }
+
+    if (this.match(TokenType.LPAREN)) {
+      return this.parseParenthesised(token.line);
+    }
+
+    if (this.match(TokenType.LBRACKET)) {
+      return this.parseBracketLiteral(token.line);
+    }
+
+    // Set literal / set comprehension: {| 1, 2, 3 |}
+    if (this.match(TokenType.LSET)) {
+      return this.parseSetLiteral(token.line);
+    }
+
+    // Dict literal: { key: value, ... }
+    if (this.check(TokenType.LBRACE)) {
+      this.advance();
+      return this.parseBraceDictLiteral(token.line);
+    }
+
+    if (this.check(TokenType.DOUBLE_COLON)) {
+      const savedPos = this.pos;
+      this.advance(); // consume ::
+      if (this.check(TokenType.DOUBLE_SEMI)) {
+        this.advance();
+        return { type: 'DictLiteral', entries: [], line: token.line };
+      }
+      this.pos = savedPos;
+      this.advance();
+      return this.parseDictLiteral(token.line);
+    }
+
+    throw new SdevError(`Unexpected token: '${token.value}'`, token.line, token.column);
+  }
+
+  /** Grouping, tuple, lambda parameter list, or generator expression. */
+  private parseParenthesised(line: number): AST.ASTNode {
+    if (this.check(TokenType.RPAREN)) {
+      this.advance();
+      if (this.match(TokenType.ARROW)) {
+        const body = this.check(TokenType.DOUBLE_COLON) ? this.parseBlockStatement() : this.parseExpression();
+        return { type: 'LambdaExpr', params: [], body, line };
+      }
+      return { type: 'TupleLiteral', elements: [], line };
+    }
+
+    const exprs: AST.ASTNode[] = [];
+    const names: string[] = [];
+    let isLambdaParams = true;
+    let sawComma = false;
+
+    do {
+      if (this.check(TokenType.RPAREN)) { sawComma = true; break; }
+      const expr = this.parseExpression();
+      // Generator expression
+      if (exprs.length === 0 && this.check(TokenType.ITERATE)) {
+        const comp = this.finishComprehension(expr, 'gen', undefined, line);
+        this.consume(TokenType.RPAREN, "Expected ')'");
+        return comp;
+      }
+      exprs.push(expr);
+      if (expr.type !== 'Identifier') isLambdaParams = false;
+      else names.push(expr.name);
+      if (this.check(TokenType.COMMA)) sawComma = true;
+    } while (this.match(TokenType.COMMA));
+
+    this.consume(TokenType.RPAREN, "Expected ')'");
+
+    if (this.match(TokenType.ARROW)) {
+      if (!isLambdaParams) throw new SdevError('Invalid lambda parameters', line);
+      const body = this.check(TokenType.DOUBLE_COLON) ? this.parseBlockStatement() : this.parseExpression();
+      return { type: 'LambdaExpr', params: names, body, line };
+    }
+
+    if (exprs.length === 1 && !sawComma) return exprs[0];
+    return { type: 'TupleLiteral', elements: exprs, line };
+  }
+
+  /** List literal or list comprehension. */
+  private parseBracketLiteral(line: number): AST.ASTNode {
+    if (this.check(TokenType.RBRACKET)) {
+      this.advance();
+      return { type: 'ArrayLiteral', elements: [], line };
+    }
+    const elements: AST.ASTNode[] = [];
+    let first = true;
+    do {
+      if (this.check(TokenType.RBRACKET)) break;
+      if (this.match(TokenType.STAR)) {
+        elements.push({ type: 'StarExpr', operand: this.parseExpression(), double: false, line });
+        first = false;
+        continue;
+      }
+      const expr = this.parseExpression();
+      if (first && this.check(TokenType.ITERATE)) {
+        const comp = this.finishComprehension(expr, 'list', undefined, line);
+        this.consume(TokenType.RBRACKET, "Expected ']'");
+        return comp;
+      }
+      elements.push(expr);
+      first = false;
+    } while (this.match(TokenType.COMMA));
+    this.consume(TokenType.RBRACKET, "Expected ']'");
+    return { type: 'ArrayLiteral', elements, line };
+  }
+
+  /** Set literal or set comprehension: {| ... |} */
+  private parseSetLiteral(line: number): AST.ASTNode {
+    if (this.check(TokenType.RSET)) {
+      this.advance();
+      return { type: 'SetLiteral', elements: [], line };
+    }
+    const elements: AST.ASTNode[] = [];
+    let first = true;
+    do {
+      if (this.check(TokenType.RSET)) break;
+      if (this.match(TokenType.STAR)) {
+        elements.push({ type: 'StarExpr', operand: this.parseExpression(), double: false, line });
+        first = false;
+        continue;
+      }
+      const expr = this.parseExpression();
+      if (first && this.check(TokenType.ITERATE)) {
+        const comp = this.finishComprehension(expr, 'set', undefined, line);
+        this.consume(TokenType.RSET, "Expected '|}'");
+        return comp;
+      }
+      elements.push(expr);
+      first = false;
+    } while (this.match(TokenType.COMMA));
+    this.consume(TokenType.RSET, "Expected '|}'");
+    return { type: 'SetLiteral', elements, line };
+  }
+
+  private parseDictLiteral(line: number): AST.DictLiteral {
+    const entries: { key: AST.ASTNode; value: AST.ASTNode }[] = [];
+    if (!this.check(TokenType.DOUBLE_SEMI)) {
+      do {
+        if (this.check(TokenType.DOUBLE_SEMI)) break;
+        const key = this.parseExpression();
+        this.consume(TokenType.COLON, "Expected ':'");
+        const value = this.parseExpression();
+        entries.push({ key, value });
+      } while (this.match(TokenType.COMMA));
+    }
+    this.consume(TokenType.DOUBLE_SEMI, "Expected ';;'");
+    return { type: 'DictLiteral', entries, line };
+  }
+
+  private parseBraceDictLiteral(line: number): AST.ASTNode {
+    const entries: { key: AST.ASTNode; value: AST.ASTNode }[] = [];
+    let first = true;
+    if (!this.check(TokenType.RBRACE)) {
+      do {
+        if (this.check(TokenType.RBRACE)) break;
+        if (this.match(TokenType.STARSTAR)) {
+          entries.push({
+            key: { type: 'StarExpr', operand: this.parseExpression(), double: true, line },
+            value: { type: 'NullLiteral', line },
+          });
+          first = false;
+          continue;
+        }
+        // Allow bare identifier or keyword keys (treated as string, e.g. { class: "card", for: "id" })
+        let key: AST.ASTNode;
+        let bareKeyToken: { value: string; line: number; isIdent: boolean } | undefined;
+        const t = this.peek();
+        if (/^[A-Za-z_$][\w$]*$/.test(t.value) && this.tokens[this.pos + 1]?.type === TokenType.COLON) {
+          this.advance();
+          bareKeyToken = { value: t.value, line: t.line, isIdent: t.type === TokenType.IDENTIFIER };
+          key = { type: 'StringLiteral', value: t.value, line: t.line };
+        } else {
+          key = this.parseExpression();
+        }
+        this.consume(TokenType.COLON, "Expected ':'");
+        const value = this.parseExpression();
+        if (first && this.check(TokenType.ITERATE)) {
+          // In a comprehension a bare identifier key is an expression,
+          // not the shorthand string key used by dict literals.
+          const compKey: AST.ASTNode = bareKeyToken && bareKeyToken.isIdent
+            ? { type: 'Identifier', name: bareKeyToken.value, line: bareKeyToken.line }
+            : key;
+          const comp = this.finishComprehension(compKey, 'dict', value, line);
+          this.consume(TokenType.RBRACE, "Expected '}'");
+          return comp;
+        }
+        entries.push({ key, value });
+        first = false;
+      } while (this.match(TokenType.COMMA));
+    }
+    this.consume(TokenType.RBRACE, "Expected '}'");
+    return { type: 'DictLiteral', entries, line };
+  }
+
+  private isEscapedOrRegexBrace(template: string, i: number): boolean {
+    // Odd number of backslashes directly before '{' => escaped '\{'
+    let bs = 0;
+    for (let k = i - 1; k >= 0 && template[k] === '\\'; k--) bs++;
+    if (bs % 2 === 1) return true;
+
+    // Check if preceded by \p or \P (Unicode property escape e.g. \p{L})
+    if (i >= 1 && (template[i - 1] === 'p' || template[i - 1] === 'P')) {
+      let bsP = 0;
+      for (let k = i - 2; k >= 0 && template[k] === '\\'; k--) bsP++;
+      if (bsP % 2 === 1) return true;
+    }
+
+    // Check if preceded by \u or \x (e.g. \u{...})
+    if (i >= 1 && (template[i - 1] === 'u' || template[i - 1] === 'x')) {
+      let bsU = 0;
+      for (let k = i - 2; k >= 0 && template[k] === '\\'; k--) bsU++;
+      if (bsU % 2 === 1) return true;
+    }
+
+    // Check if inside regex character class bracket `[...]` without closing `]`
+    let inCharClass = false;
+    for (let k = i - 1; k >= 0; k--) {
+      if (template[k] === ']' && (k === 0 || template[k - 1] !== '\\')) break;
+      if (template[k] === '[' && (k === 0 || template[k - 1] !== '\\')) {
+        inCharClass = true;
+        break;
+      }
+    }
+    if (inCharClass) return true;
+
+    // Look ahead to check if content is a regex quantifier like {1,2} or {3}
+    const close = template.indexOf('}', i + 1);
+    if (close > i + 1) {
+      const inner = template.slice(i + 1, close).trim();
+      if (/^\d+(?:\s*,\s*\d*)?$/.test(inner)) return true;
+    }
+
+    return false;
+  }
+
+  /**
+   * Compiles an f-string template into an FStringExpr. Supports `{expr}`,
+   * `{expr!r}` conversions, `{expr:spec}` format specs, `{expr=}` debug
+   * output and `{{` / `}}` escapes.
+   */
+  private buildFString(template: string, line: number): AST.FStringExpr {
+    const parts: AST.FStringPart[] = [];
+    let text = '';
+    let i = 0;
+    while (i < template.length) {
+      const ch = template[i];
+      if (ch === '{' && template[i + 1] === '{') { text += '{'; i += 2; continue; }
+      if (ch === '}' && template[i + 1] === '}') { text += '}'; i += 2; continue; }
+      if (ch === '{') {
+        if (this.isEscapedOrRegexBrace(template, i)) {
+          text += ch;
+          i++;
+          continue;
+        }
+        if (text) { parts.push({ kind: 'text', value: text }); text = ''; }
+        let depth = 1;
+        let body = '';
+        i++;
+        while (i < template.length && depth > 0) {
+          const c = template[i];
+          if (c === '{') depth++;
+          else if (c === '}') { depth--; if (depth === 0) break; }
+          body += c;
+          i++;
+        }
+        i++; // closing }
+        let spec: string | undefined;
+        let conv: string | undefined;
+        let debug: string | undefined;
+
+        // Format spec (last top-level ':' outside brackets)
+        let bracket = 0;
+        let specIdx = -1;
+        for (let k = 0; k < body.length; k++) {
+          const c = body[k];
+          if (c === '[' || c === '(' || c === '{') bracket++;
+          else if (c === ']' || c === ')' || c === '}') bracket--;
+          else if (c === ':' && bracket === 0) { specIdx = k; break; }
+        }
+        if (specIdx >= 0) {
+          spec = body.slice(specIdx + 1);
+          body = body.slice(0, specIdx);
+        }
+        const convMatch = /!([rsa])$/.exec(body);
+        if (convMatch) {
+          conv = convMatch[1];
+          body = body.slice(0, -2);
+        }
+        if (body.trimEnd().endsWith('=')) {
+          debug = body.slice(0, body.lastIndexOf('=')).trim();
+          body = debug;
+        }
+
+        try {
+          const sub = new Parser(this.lexTemplate(body, line));
+          parts.push({ kind: 'expr', expr: sub.parseExpression(), spec, conv, debug });
+        } catch {
+          text += '{' + body + (spec ? ':' + spec : '') + '}';
+        }
+        continue;
+      }
+      text += ch;
+      i++;
+    }
+    if (text) parts.push({ kind: 'text', value: text });
+    return { type: 'FStringExpr', parts, line };
+  }
+
+
+
+  /**
+   * `fixed` / `const` / `val` start a constant declaration only in the shape
+   * `fixed name be ...` (or `fixed a, b be ...`, `fixed name: Type`). Anywhere
+   * else they are ordinary names, so `forge val be 3` and `val + 1` still work.
+   */
+  private isContextualFixedStart(): boolean {
+    const t = this.peek();
+    if (t.type !== TokenType.IDENTIFIER || !FIXED_WORDS.has(t.value)) return false;
+    const name = this.tokens[this.pos + 1];
+    const after = this.tokens[this.pos + 2];
+    if (!name || name.type !== TokenType.IDENTIFIER || !after) return false;
+    return after.type === TokenType.BE || after.type === TokenType.COMMA || after.type === TokenType.COLON;
+  }
+
+  private lexTemplate(source: string, line: number): Token[] {
+    const tokens = new Lexer(source, { sourceLanguage: null }).tokenize();
+    return tokens.map((t) => ({ ...t, line }));
+  }
+
+  // ==========================================================
+  // Helpers
+  // ==========================================================
+
+  private peek(): Token {
+    return this.tokens[this.pos];
+  }
+
+  private previous(): Token {
+    return this.tokens[this.pos - 1];
+  }
+
+  private isAtEnd(): boolean {
+    return this.peek().type === TokenType.EOF;
+  }
+
+  private advance(): Token {
+    if (!this.isAtEnd()) this.pos++;
+    return this.previous();
+  }
+
+  private check(type: TokenType): boolean {
+    if (this.isAtEnd()) return false;
+    return this.peek().type === type;
+  }
+
+  /** Check if current token is IDENTIFIER with a specific value */
+  /**
+   * `essence` and `kind` are contextual: they begin a class declaration only
+   * when a class name follows. Everywhere else they stay plain identifiers.
+   */
+  private isContextualClassStart(): boolean {
+    if (!this.checkIdentifierValue('essence') && !this.checkIdentifierValue('kind')) return false;
+    const next = this.tokens[this.pos + 1];
+    return !!next && next.type === TokenType.IDENTIFIER;
+  }
+
+  private checkIdentifierValue(value: string): boolean {
+    if (this.isAtEnd()) return false;
+    const t = this.peek();
+    return t.type === TokenType.IDENTIFIER && t.value === value;
+  }
+
+  private match(...types: TokenType[]): boolean {
+    for (const type of types) {
+      if (this.check(type)) {
+        this.advance();
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private consume(type: TokenType, message: string): Token {
+    if (this.check(type)) return this.advance();
+    const token = this.peek();
+    throw new SdevError(message + ` (got '${token.value}')`, token.line, token.column);
+  }
+
+  /**
+   * Consumes a plain name. Soft keywords (`match`, `case`, `when`, `emit`,
+   * `pass`, ...) stay usable as identifiers so older programs keep working.
+   */
+  private consumeName(message: string): string {
+    const t = this.peek();
+    const soft = new Set<TokenType>([
+      TokenType.MATCH, TokenType.CASE, TokenType.WHEN, TokenType.EMIT,
+      TokenType.DELEGATE, TokenType.PASS, TokenType.AS, TokenType.IS,
+      TokenType.FROM, TokenType.WITH, TokenType.DEL, TokenType.ASSERT,
+      TokenType.GLOBAL, TokenType.NONLOCAL, TokenType.RAISE, TokenType.ELIF,
+      TokenType.LAMBDA, TokenType.FINALLY,
+    ]);
+    if (t.type === TokenType.IDENTIFIER || soft.has(t.type)) {
+      this.advance();
+      return t.value;
+    }
+    throw new SdevError(message + ` (got '${t.value}')`, t.line, t.column);
+  }
+}

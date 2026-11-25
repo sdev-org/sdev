@@ -1,0 +1,72 @@
+# =============================================================================
+# Zero-Host Pure-SDEV CLI, Native ELF & Windows PE32+ Verification Suite
+# (sdev-zero/scripts/test-zero-host-cli.sdev)
+#
+#   ./bin/sdev scripts/test-zero-host-cli.sdev
+# =============================================================================
+
+use "lang/stdlib/testkit.sdev"
+use "lang/native/pe_x64.sdev"
+use "lang/native/codegen_x64.sdev"
+
+# 1. Pure-SDEV Windows x86-64 PE32+ Console Executable Builder
+set pe_buf to pe_build_console_exe("Hello Windows PE32+!\r\n", 7)
+set _ to check("PE32+ console executable is 2048 bytes", pe_buf[0] is 2048)
+set _ to check("PE32+ header has MZ and PE\\0\\0 signature", pe_verify_header(pe_buf) is 1)
+set pe_hex to pe_to_hex(pe_buf)
+set _ to check("PE32+ hex encoding is 4096 hex chars starting with 4d5a", length(pe_hex) is 4096 and substr(pe_hex, 0, 4) is "4d5a")
+
+# 2. Pure-SDEV Bytecode -> x86-64 GAS Assembly Compiler
+# Bytecode for: PUSH_I32 99, SAY_I32, HALT
+set mini_bc to [1, 99, 0, 0, 0, 80, 255]
+set mini_asm to x64_compile_bytecode(mini_bc, mklist(0))
+set _ to check("x64_compile_bytecode emits sdev_main", contains(mini_asm, ".globl sdev_main"))
+set _ to check("x64_compile_bytecode emits sdev_say_int call", contains(mini_asm, "call sdev_say_int"))
+
+# 3. Pure-SDEV CLI Subcommands Verification
+set r_api to shell("./bin/sdev api mat_mul")
+set _ to check("CLI 'sdev api mat_mul' resolves matrix module", contains(r_api, "module 'matrix'"))
+
+set r_exp to shell("./bin/sdev explain SDEV001")
+set _ to check("CLI 'sdev explain SDEV001' explains block delimiter diagnostic", contains(r_exp, "SDEV001:"))
+
+set r_eval to shell("./bin/sdev eval \"say 6 * 7\"")
+set _ to check("CLI 'sdev eval' executes inline SDEV code", contains(r_eval, "42"))
+
+set r_chk to shell("./bin/sdev check lang/compiler/lexer.sdev")
+set _ to check("CLI 'sdev check' validates lexer.sdev", contains(r_chk, "syntax & symbols OK"))
+
+set r_dis to shell("./bin/sdev disasm lang/compiler/parser.sdev")
+set _ to check("CLI 'sdev disasm' disassembles bytecode instructions", contains(r_dis, "PUSH_I32") and contains(r_dis, "HALT"))
+
+set r_lint to shell("./bin/sdev lint lang/compiler/lexer.sdev")
+set _ to check("CLI 'sdev lint' passes clean SDEV file with 0 issues", contains(r_lint, "0 lint issues"))
+
+set r_v1 to shell("./bin/sdev v1 lang/parity/agent.sdev")
+set _ to check("CLI 'sdev v1' transpiles v1 conjure/forge to v2 to/set", contains(r_v1, "to unquote with s"))
+
+# 4. Zero-Host v1 Native Self-Hosting, Bare-Metal Driver & CLI Subcommands
+set r_v1_boot to shell("./bin/sdev bootstrap --v1")
+set _ to check("CLI 'sdev bootstrap --v1' verifies v1 Stage 1 == Stage 2 == Stage 3", contains(r_v1_boot, "Pure-v1 Fixed-Point Verified"))
+
+set r_v1_ev to shell("./bin/sdev eval --v1 \"speak(6 * 7)\"")
+set _ to check("CLI 'sdev eval --v1' executes inline v1 code", contains(r_v1_ev, "42"))
+
+set tmp_v1 to ".tmp_zh_v1.sdev"
+set _ to write_file(tmp_v1, "essence Pair ::\n  conjure init(me, a, b) ::\n    me.a be a\n    me.b be b\n  ;;\n  conjure total(me) ::\n    yield me.a + me.b\n  ;;\n;;\nforge p be new Pair(19, 23)\nspeak(p.total())\n")
+set r_v1_chk to shell("./bin/sdev check --v1 " + tmp_v1)
+set _ to check("CLI 'sdev check --v1' validates pure v1 source", contains(r_v1_chk, "syntax & symbols OK"))
+
+set r_v1_dis to shell("./bin/sdev disasm --v1 " + tmp_v1)
+set _ to check("CLI 'sdev disasm --v1' disassembles v1 bytecode", contains(r_v1_dis, "PUSH_STR") and contains(r_v1_dis, "PUSH_I32"))
+
+set r_v1_cmp to shell("./bin/sdev compile --v1 " + tmp_v1 + " -o .tmp_zh_v1.sdevc && ./bin/sdev run-bc .tmp_zh_v1.sdevc")
+set _ to check("CLI 'sdev compile --v1' + 'run-bc' outputs 42", contains(r_v1_cmp, "compiled ") and contains(r_v1_cmp, "42"))
+
+set r_v1_nat to shell("./bin/sdev native --v1 " + tmp_v1 + " -o .tmp_zh_v1_elf && ./.tmp_zh_v1_elf")
+set _ to check("CLI 'sdev native --v1' builds static x86-64 ELF outputting 42", contains(r_v1_nat, "static Linux ELF") and contains(r_v1_nat, "\n42"))
+
+set r_v1_drv to shell("./bin/sdev-v1-driver lang/compiler/v1_self.sdev > .tmp_zh_v1_elf.out && head -n 1 .tmp_zh_v1_elf.out && wc -l < .tmp_zh_v1_elf.out && rm -f .tmp_zh_v1.sdev .tmp_zh_v1.sdevc .tmp_zh_v1_elf .tmp_zh_v1_elf.s .tmp_zh_v1_elf.out")
+set _ to check("Bare-metal ELF './bin/sdev-v1-driver' self-compiles v1_self.sdev", contains(r_v1_drv, "30972") and contains(r_v1_drv, "38020"))
+
+set _ to tk_report("zero-host pure-SDEV CLI & native targets suite")

@@ -1,0 +1,31 @@
+project_id = "ygzqjekxzvsrkhuqhqbp"
+
+[functions]
+  [functions.auth-email-hook]
+    verify_jwt = false
+  [functions.compile-firmware]
+    verify_jwt = false
+  [functions.draft-dialect]
+    verify_jwt = false
+  [functions.handle-email-suppression]
+    verify_jwt = false
+  [functions.handle-email-unsubscribe]
+    verify_jwt = false
+  [functions.mcp]
+    verify_jwt = false
+  [functions.preview-transactional-email]
+    verify_jwt = false
+  [functions.process-email-queue]
+    verify_jwt = true
+  [functions.sdev-agent]
+    verify_jwt = false
+  [functions.sdev-chat]
+    verify_jwt = false
+  [functions.sdev-fix]
+    verify_jwt = false
+  [functions.send-transactional-email]
+    verify_jwt = true
+  [functions.translate-code]
+    verify_jwt = false
+  [functions.translate-fuzzy]
+    verify_jwt = false

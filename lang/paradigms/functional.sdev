@@ -1,0 +1,118 @@
+# SDEV Paradigms: Functional Programming & Algebraic Types — authored in SDEV.
+
+# ---- Option Type ----------------------------------------------------------
+
+to Some with val
+  return { tag: "Some", val: val }
+end
+
+to None
+  return { tag: "None", val: 0 }
+end
+
+to is_some with opt
+  return opt["tag"] is "Some"
+end
+
+to is_none with opt
+  return opt["tag"] is "None"
+end
+
+to unwrap_or with opt fallback
+  if is_some(opt)
+    return opt["val"]
+  end
+  return fallback
+end
+
+to map_some with opt fn
+  if is_some(opt)
+    return Some(call fn(opt["val"]))
+  end
+  return None()
+end
+
+to flat_map_some with opt fn
+  if is_some(opt)
+    return call fn(opt["val"])
+  end
+  return None()
+end
+
+# ---- Result Type ----------------------------------------------------------
+
+to Ok with val
+  return { tag: "Ok", val: val }
+end
+
+to Err with err
+  return { tag: "Err", err: err }
+end
+
+to is_ok with res
+  return res["tag"] is "Ok"
+end
+
+to is_err with res
+  return res["tag"] is "Err"
+end
+
+to result_unwrap_or with res fallback
+  if is_ok(res)
+    return res["val"]
+  end
+  return fallback
+end
+
+to map_ok with res fn
+  if is_ok(res)
+    return Ok(call fn(res["val"]))
+  end
+  return res
+end
+
+to flat_map_ok with res fn
+  if is_ok(res)
+    return call fn(res["val"])
+  end
+  return res
+end
+
+# ---- Pattern Matching Helper ----------------------------------------------
+
+to match_adt with adt on_some on_none
+  if is_some(adt)
+    return on_some
+  end
+  return on_none
+end
+
+to match_result with res on_ok on_err
+  if is_ok(res) is 1
+    return call on_ok(res["val"])
+  end
+  return call on_err(res["err"])
+end
+
+to match_option_fn with opt on_some on_none
+  if is_some(opt) is 1
+    return call on_some(opt["val"])
+  end
+  return call on_none()
+end
+
+to func_pipe2 with x f g
+  set r1 to call f(x)
+  return call g(r1)
+end
+
+to func_pipe3 with x f g h
+  set r1 to call f(x)
+  set r2 to call g(r1)
+  return call h(r2)
+end
+
+to func_compose2 with f g x
+  set r1 to call g(x)
+  return call f(r1)
+end
